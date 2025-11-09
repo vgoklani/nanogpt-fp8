@@ -16,20 +16,22 @@ print("\nNVFP4 Support:", check_nvfp4_support())
 print("\nDevice Compute Capability:", get_device_compute_capability())
 
 # hyperparameters
-batch_size = 8 # how many independent sequences will we process in parallel?
-block_size = 1024 # what is the maximum context length for predictions?
+batch_size = 2 # how many independent sequences will we process in parallel?
+block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
+print_interval = 1
 eval_interval = 100
-learning_rate = 3e-4
+learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 200
-n_embd = 768
-n_head = 12
-n_layer = 12
+eval_iters = 20
+n_layer = 20
+n_embd = n_layer*64
+n_head = max(1, (n_embd + 127) // 128)
 dropout = 0.0
 # ------------
-
+print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 torch.manual_seed(1337)
+fp8_recipe = Float8CurrentScaling()
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -37,7 +39,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 
 # here are all the unique characters that occur in this text
 chars = sorted(list(set(text)))
-vocab_size = 50304
+vocab_size = 65536
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
@@ -60,32 +62,31 @@ val_data = data[n:]
 #     y = torch.stack([data[i+1:i+block_size+1] for i in ix])
 #     x, y = x.to(device), y.to(device)
 #     return x, y
-
+@torch.no_grad()
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([(data[i:i+block_size].long()) for i in ix])
-    y = torch.stack([(data[i+1:i+1+block_size].long()) for i in ix])
-    if device == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
+    # Vectorized indexing - much faster than list comprehension
+    idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
+    idx_y = idx_x + 1
+    x = data[idx_x]  # Fancy indexing: (batch_size, block_size)
+    y = data[idx_y]
+    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
     return x, y
+
 
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros(eval_iters, device=device)  # Keep on GPU
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):  # Enable FP8!
+                logits, loss = model(X, Y)
+            losses[k] = loss  # Keep on GPU, don't call .item() yet
+        out[split] = losses.mean().item()  # Single CPU-GPU sync at the end
     model.train()
     return out
 
@@ -97,32 +98,40 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        
+        # Initialize RoPE - dimension should be head_dim (hidden_size / num_heads)
+        self.rope = te.RotaryPositionEmbedding(
+            dim=n_embd // n_head,  # Apply RoPE to each attention head
+            pretrained_max_position_embeddings=block_size
+        )
         self.blocks = nn.ModuleDict({f"block_{i}": te.TransformerLayer(
             activation='relu', 
             attention_dropout=dropout, 
             hidden_dropout=dropout, 
             hidden_size=n_embd, 
-            ffn_hidden_size=3*n_embd, 
+            ffn_hidden_size=4*n_embd, 
             num_attention_heads=n_head,
             attn_input_format='bshd',  # Critical: our input is (batch, seq, hidden)
             layer_number=i+1,
-            # params_dtype=torch.bfloat16,
-            # normalization='RMSNorm'
-        ) for i in range(n_layer)})
+            bias=False,
+            qk_norm_type='RMSNorm',
+            fuse_qkv_params=True,
+            seq_length=block_size,
+            micro_batch_size=batch_size,
+            
+        ) for i in range(n_layer)}) 
         self.ln_f = te.LayerNorm(n_embd) # final layer norm
-        self.lm_head = te.Linear(n_embd, vocab_size)
-        self.token_embedding_table.weight = self.lm_head.weight # tie weights
-
+        self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
+        # self.token_embedding_table.weight = self.lm_head.weight # tie weights
+    
     def forward(self, idx, targets=None):
         B, T = idx.shape
+        rotary_pos_emb = self.rope(T)  # Shape: (T, 1, 1, head_dim)
         # idx and targets are both (B,T) tensor of integers
-        tok_emb = self.token_embedding_table(idx) # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
+        x = self.token_embedding_table(idx) # (B,T,C)
+        # pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         for i in range(n_layer):
-            x = self.blocks[f"block_{i}"](x, self_attn_mask_type="causal")
+            x = self.blocks[f"block_{i}"](x, rotary_pos_emb=rotary_pos_emb,
+                                          self_attn_mask_type="causal")
         x = self.ln_f(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
@@ -135,7 +144,7 @@ class BigramLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
-
+    @torch.no_grad()
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
@@ -160,10 +169,10 @@ print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
 hidden_weights = [p for p in model.blocks.parameters() if p.ndim >= 2]
 hidden_gains_biases = [p for p in model.blocks.parameters() if p.ndim < 2]
-nonhidden_params = [*model.position_embedding_table.parameters(), *model.token_embedding_table.parameters(), *model.lm_head.parameters()]
+nonhidden_params = [*model.token_embedding_table.parameters(),*model.lm_head.parameters(),*model.ln_f.parameters()]
 param_groups = [
     dict(params=hidden_weights, use_muon=True,
-         lr=0.01, weight_decay=0.01),
+         lr=0.004, weight_decay=0.01),
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
 ]
@@ -171,33 +180,39 @@ torch.backends.cuda.matmul.fp32_precision = 'ieee'
 torch.backends.cudnn.conv.fp32_precision = 'tf32'
 # optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
 optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
-fp8_recipe = NVFP4BlockScaling(disable_rht=True)
-t0 = time.time()
+t0 = time.time()  # Overall start time
+total_training_time = 0  # Track total time (excluding first few iterations)
 for iter in range(max_iters):
-    t1 = time.time()
-    should_print = iter % eval_interval == 0 or iter == max_iters - 1
-    # every once in a while evaluate the loss on train and val sets
-    if should_print:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-    # sample a batch of data
     xb, yb = get_batch('train')
-    # xb,yb = xb.bfloat16(),yb.bfloat16()
-    
+    t1 = time.time()
+    should_print = iter % print_interval == 0 or iter == max_iters - 1   
     with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-        # evaluate the loss
         logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    
+    t2 = time.time()
+    dt = t2 - t1  
+    
+    tokens_per_iteration = batch_size * block_size
+    tok_per_sec = int(tokens_per_iteration / dt)
+    
+    # Track total training time (skip first 10 iterations for warmup)
+    if iter > 10:
+        total_training_time += dt
+    
     if should_print:
-        t2 = time.time()
-        print(f"iter time: {(t2 - t1):.2f}s")
-        print(f"total time: {(t2 - t0)/60:.2f} min")
+        print(f"step {iter}: train loss {loss.detach():.4f}")
+        print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
+        print(f"total time: {total_training_time/60:.2f} min")
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
         print(f"{mem_used_GB:.2f} GB used")
         print('------------')
+    if iter % eval_interval == 0 and iter > 0:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
