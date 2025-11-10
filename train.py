@@ -18,16 +18,18 @@ print("\nDevice Compute Capability:", get_device_compute_capability())
 USE_FP8 = True
 USE_AMP = True
 USE_FP8_WEIGHTS = False
+USE_CUDA_GRAPH = True
+
 
 # hyperparameters
-batch_size = 4 # how many independent sequences will we process in parallel?
+batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
 eval_interval = 300
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 5
+eval_iters = 20
 n_layer = 20
 n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
@@ -35,7 +37,7 @@ dropout = 0.0
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 torch.manual_seed(1337)
-fp8_recipe = DelayedScaling(disable_rht=True)
+fp8_recipe = DelayedScaling()
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -82,29 +84,35 @@ def get_batch(split):
 @torch.no_grad()
 def estimate_loss(reuse_input=None, reuse_target=None):
     """
-    Memory-efficient evaluation that reuses training batch tensors.
-    If reuse_input and reuse_target are provided, uses them instead of allocating new tensors.
+    Memory-efficient evaluation that runs at batch size 1.
+    Uses a slice of the provided tensors or allocates a batch-size-1 tensor.
     """
     out = {}
+    model.eval()
     
+    # Always use batch size 1 for evaluation to minimize VRAM
+    eval_batch_size = 1
+    
+    # Determine if we can reuse a slice of training tensors or need to allocate
     if reuse_input is not None and reuse_target is not None:
-        eval_input = reuse_input
-        eval_target = reuse_target
-        reuse_mode = True
+        # Use only the first element (batch size 1) of the training tensors
+        eval_input = reuse_input[:eval_batch_size]  # Shape: (1, block_size)
+        eval_target = reuse_target[:eval_batch_size]  # Shape: (1, block_size)
     else:
-        eval_input = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
-        eval_target = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
-        reuse_mode = False
+        # Fallback: allocate batch-size-1 tensors
+        eval_input = torch.empty((eval_batch_size, block_size), dtype=torch.long, device=device)
+        eval_target = torch.empty((eval_batch_size, block_size), dtype=torch.long, device=device)
     
     for split in ['train', 'val']:
         loss_sum = 0.0  
         for k in range(eval_iters):
-            
+            # Get batch data for batch size 1
             data = train_data if split == 'train' else val_data
-            ix = torch.randint(len(data) - block_size, (batch_size,))
+            ix = torch.randint(len(data) - block_size, (eval_batch_size,))
             idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
             idx_y = idx_x + 1
             
+            # Copy into the batch-size-1 slice
             eval_input.copy_(data[idx_x], non_blocking=True)
             eval_target.copy_(data[idx_y], non_blocking=True)
             
@@ -116,6 +124,7 @@ def estimate_loss(reuse_input=None, reuse_target=None):
         
         out[split] = loss_sum / eval_iters
     
+    model.train()
     return out
 
 
@@ -193,7 +202,7 @@ class BigramLanguageModel(nn.Module):
 # with te.fp8_model_init(enabled=USE_FP8_WEIGHTS, recipe=fp8_recipe):
 model = BigramLanguageModel().to(device)
 
-model = torch.compile(model,mode='max-autotune-no-cudagraphs')
+model = torch.compile(model,mode="max-autotune-no-cudagraphs")
 
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
@@ -225,10 +234,10 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 #                                   lr=param_groups[0]['lr'],
 #                                   weight_decay=param_groups[0]['weight_decay'])
 
-# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-#                                   lr=param_groups[0]['lr'],
-#                                   weight_decay=param_groups[0]['weight_decay'],)
-optimizer_adamw = torch.optim.AdamW(model.parameters(),
+optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+                                  lr=param_groups[0]['lr'],
+                                  weight_decay=param_groups[0]['weight_decay'],)
+optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
                                     lr=param_groups[1]['lr'],
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
@@ -243,13 +252,12 @@ gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
 
 @torch.compile()
-def gradscaler_step():
-    # gradScaler.step(optimizer_muon)
+def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
+def gradscaler_step():
+    gradScaler.step(optimizer_muon)
+    gradscaler_step_adamw()
 
-    
-USE_CUDA_GRAPH = True
-print(f"\nCUDA Graphs enabled: {USE_CUDA_GRAPH}")
 
 if USE_CUDA_GRAPH:
     
@@ -266,7 +274,7 @@ if USE_CUDA_GRAPH:
             static_input.copy_(xb)
             static_target.copy_(yb)
             
-            # optimizer_muon.zero_grad(set_to_none=True)
+            optimizer_muon.zero_grad(set_to_none=True)
             optimizer_adamw.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
@@ -276,11 +284,10 @@ if USE_CUDA_GRAPH:
             gradScaler.scale(loss).backward()
     torch.cuda.current_stream().wait_stream(s)
     
-    # Capture the graph
     print("Capturing CUDA graph...")
     g = torch.cuda.CUDAGraph()
     
-    # optimizer_muon.zero_grad(set_to_none=True)
+    optimizer_muon.zero_grad(set_to_none=True)
     optimizer_adamw.zero_grad(set_to_none=True)
     
     with torch.cuda.graph(g):
@@ -318,7 +325,7 @@ for iter in range(max_iters):
         loss = static_loss
     else:
         # Original non-graph path
-        # optimizer_muon.zero_grad()
+        optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
         xb, yb = get_batch('train')
         
