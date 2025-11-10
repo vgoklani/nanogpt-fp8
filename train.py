@@ -20,14 +20,14 @@ USE_AMP = True
 USE_FP8_WEIGHTS = False
 
 # hyperparameters
-batch_size = 6 # how many independent sequences will we process in parallel?
+batch_size = 4 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
-print_interval = 1
-eval_interval = 100
+print_interval = 20
+eval_interval = 300
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 20
+eval_iters = 5
 n_layer = 20
 n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
@@ -80,19 +80,42 @@ def get_batch(split):
 
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(reuse_input=None, reuse_target=None):
+    """
+    Memory-efficient evaluation that reuses training batch tensors.
+    If reuse_input and reuse_target are provided, uses them instead of allocating new tensors.
+    """
     out = {}
-    model.eval()
+    
+    if reuse_input is not None and reuse_target is not None:
+        eval_input = reuse_input
+        eval_target = reuse_target
+        reuse_mode = True
+    else:
+        eval_input = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
+        eval_target = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
+        reuse_mode = False
+    
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters, device=device)  # Keep on GPU
+        loss_sum = 0.0  
         for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with torch.amp.autocast('cuda',enabled=USE_AMP, dtype=torch.bfloat16):
-                with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):  # Enable FP8!
-                    logits, loss = model(X, Y)
-            losses[k] = loss  # Keep on GPU, don't call .item() yet
-        out[split] = losses.mean().item()  # Single CPU-GPU sync at the end
-    model.train()
+            
+            data = train_data if split == 'train' else val_data
+            ix = torch.randint(len(data) - block_size, (batch_size,))
+            idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
+            idx_y = idx_x + 1
+            
+            eval_input.copy_(data[idx_x], non_blocking=True)
+            eval_target.copy_(data[idx_y], non_blocking=True)
+            
+            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
+                with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):
+                    _, loss = model(eval_input, eval_target)
+            
+            loss_sum += loss.item()
+        
+        out[split] = loss_sum / eval_iters
+    
     return out
 
 
@@ -167,8 +190,10 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 # with torch.amp.autocast('cuda',enabled=USE_AMP, dtype=torch.bfloat16):
-with te.fp8_model_init(enabled=USE_FP8_WEIGHTS, recipe=fp8_recipe):
-        model = BigramLanguageModel().to(device)
+# with te.fp8_model_init(enabled=USE_FP8_WEIGHTS, recipe=fp8_recipe):
+model = BigramLanguageModel().to(device)
+
+model = torch.compile(model,mode='max-autotune-no-cudagraphs')
 
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
@@ -181,53 +206,72 @@ param_groups = [
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
 ]
-torch.backends.cuda.matmul.fp32_precision = 'tf32'
-torch.backends.cudnn.conv.fp32_precision = 'tf32'
+torch.backends.fp32_precision = "tf32"
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
+torch.backends.cudnn.rnn.fp32_precision = "tf32"
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cudnn.allow_tf32 = True
 torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+
+
 
 
 # optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+
 # optimizer_muon = SingleDeviceNorMuon(param_groups[0]['params'],
 #                                   lr=param_groups[0]['lr'],
 #                                   weight_decay=param_groups[0]['weight_decay'])
 
-optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-                                  lr=param_groups[0]['lr'],
-                                  weight_decay=param_groups[0]['weight_decay'],)
-optimizer_adamw = bnb.optim.adamw.AdamW(param_groups[1]['params'],
+# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+#                                   lr=param_groups[0]['lr'],
+#                                   weight_decay=param_groups[0]['weight_decay'],)
+optimizer_adamw = torch.optim.AdamW(model.parameters(),
                                     lr=param_groups[1]['lr'],
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
-                                    optim_bits=8)
+                                    capturable=True,
+                                    # optim_bits=8,
+                                    # fused=True,
+                                    # foreach=True
+                                    )
 
+    
 gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
-# CUDA Graph setup
+
+@torch.compile()
+def gradscaler_step():
+    # gradScaler.step(optimizer_muon)
+    gradScaler.step(optimizer_adamw)
+
+    
 USE_CUDA_GRAPH = True
 print(f"\nCUDA Graphs enabled: {USE_CUDA_GRAPH}")
 
 if USE_CUDA_GRAPH:
-    # Create static tensors for graph capture
+    
     static_input = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
     static_target = torch.empty((batch_size, block_size), dtype=torch.long, device=device)
     
-    # Warmup: must run on a side stream before capture
     print("Warming up for CUDA graph capture...")
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
-        for i in range(3):
-            # Get real data for warmup
+        for i in range(3): # a few iterations to warm up
+            
             xb, yb = get_batch('train')
             static_input.copy_(xb)
             static_target.copy_(yb)
             
-            optimizer_muon.zero_grad(set_to_none=True)
+            # optimizer_muon.zero_grad(set_to_none=True)
             optimizer_adamw.zero_grad(set_to_none=True)
             
             with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
                 with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):
-                    logits, loss = model(static_input, static_target)
+                    _, loss = model(static_input, static_target)
             
             gradScaler.scale(loss).backward()
     torch.cuda.current_stream().wait_stream(s)
@@ -236,9 +280,7 @@ if USE_CUDA_GRAPH:
     print("Capturing CUDA graph...")
     g = torch.cuda.CUDAGraph()
     
-    # Zero grads before capture with set_to_none=True
-    # so backward() will create .grad attributes from the graph's private pool
-    optimizer_muon.zero_grad(set_to_none=True)
+    # optimizer_muon.zero_grad(set_to_none=True)
     optimizer_adamw.zero_grad(set_to_none=True)
     
     with torch.cuda.graph(g):
@@ -268,25 +310,25 @@ for iter in range(max_iters):
         g.replay()
         
         # Run optimizer steps eagerly (not part of the graph)
-        gradScaler.step(optimizer_muon)
-        gradScaler.step(optimizer_adamw)
+        
+        gradscaler_step()
         gradScaler.update()
         
         # Use static_loss for logging
         loss = static_loss
     else:
         # Original non-graph path
-        optimizer_muon.zero_grad()
+        # optimizer_muon.zero_grad()
         optimizer_adamw.zero_grad()
         xb, yb = get_batch('train')
         
         with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
             with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):
-                logits, loss = model(xb, yb)
+                _, loss = model(xb, yb)
         
         gradScaler.scale(loss).backward()
-        gradScaler.step(optimizer_muon)
-        gradScaler.step(optimizer_adamw)
+        
+        gradscaler_step()
         gradScaler.update()
     
     t2 = time.time()
@@ -308,7 +350,11 @@ for iter in range(max_iters):
         print(f"{mem_used_GB:.2f} GB used")
         print('------------')
     if iter % eval_interval == 0 and iter > 0:
-        losses = estimate_loss()
+        # Reuse training batch tensors for evaluation to save VRAM
+        if USE_CUDA_GRAPH:
+            losses = estimate_loss(reuse_input=static_input, reuse_target=static_target)
+        else:
+            losses = estimate_loss(reuse_input=xb, reuse_target=yb)
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
 # generate from the model
