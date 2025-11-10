@@ -3,20 +3,23 @@ import torch.nn as nn
 from torch.nn import functional as F
 import time
 import transformer_engine.pytorch as te
-from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support,check_mxfp8_support,check_nvfp4_support,get_device_compute_capability
+# from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support,check_mxfp8_support,check_nvfp4_support,get_device_compute_capability
 from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling,MXFP8BlockScaling
 from normuon import SingleDeviceNorMuonWithAuxAdam
 import bitsandbytes as bnb
 import numpy as np
 
-print ("Transformer Engine FP8 support status:")
-print("\nFP8 Block Scaling Support:", check_fp8_block_scaling_support())
-print("\nMXFP8 Support:", check_mxfp8_support())
-print("\nNVFP4 Support:", check_nvfp4_support())
-print("\nDevice Compute Capability:", get_device_compute_capability())
+# print ("Transformer Engine FP8 support status:")
+# print("\nFP8 Block Scaling Support:", check_fp8_block_scaling_support())
+# print("\nMXFP8 Support:", check_mxfp8_support())
+# print("\nNVFP4 Support:", check_nvfp4_support())
+# print("\nDevice Compute Capability:", get_device_compute_capability())
+
+USE_FP8 = True
+USE_AMP = True
 
 # hyperparameters
-batch_size = 2 # how many independent sequences will we process in parallel?
+batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 1
@@ -31,7 +34,7 @@ dropout = 0.0
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 torch.manual_seed(1337)
-fp8_recipe = Float8CurrentScaling()
+fp8_recipe = DelayedScaling()
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -83,8 +86,9 @@ def estimate_loss():
         losses = torch.zeros(eval_iters, device=device)  # Keep on GPU
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):  # Enable FP8!
-                logits, loss = model(X, Y)
+            with torch.amp.autocast('cuda',enabled=USE_AMP, dtype=torch.bfloat16):
+                with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):  # Enable FP8!
+                    logits, loss = model(X, Y)
             losses[k] = loss  # Keep on GPU, don't call .item() yet
         out[split] = losses.mean().item()  # Single CPU-GPU sync at the end
     model.train()
@@ -161,9 +165,8 @@ class BigramLanguageModel(nn.Module):
             # append sampled index to the running sequence
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
-
-model = BigramLanguageModel()
-model = model.to(device)
+with torch.amp.autocast('cuda',enabled=USE_AMP, dtype=torch.bfloat16):
+    model = BigramLanguageModel().to(device)
 
 print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
@@ -176,21 +179,39 @@ param_groups = [
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
 ]
-torch.backends.cuda.matmul.fp32_precision = 'ieee'
+torch.backends.cuda.matmul.fp32_precision = 'tf32'
 torch.backends.cudnn.conv.fp32_precision = 'tf32'
+torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+
+
 # optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
-optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+# optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+
+optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+                                  lr=param_groups[0]['lr'],
+                                  weight_decay=param_groups[0]['weight_decay'],)
+optimizer_adamw = bnb.optim.adamw.AdamW(param_groups[1]['params'],
+                                    lr=param_groups[1]['lr'],
+                                    betas=param_groups[1]['betas'],
+                                    weight_decay=param_groups[1]['weight_decay'],
+                                    optim_bits=32)
+
+gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 t0 = time.time()  # Overall start time
 total_training_time = 0  # Track total time (excluding first few iterations)
 for iter in range(max_iters):
+    optimizer_muon.zero_grad()
+    optimizer_adamw.zero_grad()
     xb, yb = get_batch('train')
     t1 = time.time()
     should_print = iter % print_interval == 0 or iter == max_iters - 1   
-    with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-        logits, loss = model(xb, yb)
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+    with torch.amp.autocast('cuda',enabled=USE_AMP, dtype=torch.bfloat16):
+        with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe):
+            logits, loss = model(xb, yb)
+    gradScaler.scale(loss).backward()
+    gradScaler.step(optimizer_muon)
+    gradScaler.step(optimizer_adamw)
+    gradScaler.update()
     
     t2 = time.time()
     dt = t2 - t1  
