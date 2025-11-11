@@ -1,3 +1,4 @@
+import glob
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -46,8 +47,10 @@ n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
 dropout = 0.0
 vocab_size = 50304
-grad_accum_steps = 16
+grad_accum_steps = 64
 dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
+input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
+input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 fp8_recipe = DelayedScaling()
@@ -117,33 +120,115 @@ data_dir = os.path.join('data', dataset)
 # Initialize optimized dataloaders
 # Note: VectorizedFastDataLoader is used here for maximum performance
 # It uses pre-allocated pinned memory and vectorized numpy operations
-train_loader = VectorizedFastDataLoader(
-    data_path=data_dir,
-    block_size=block_size,
-    batch_size=batch_size,
-    split='train',
-    device=device,
-    seed=1337,
-    rank=seed_offset if USE_DDP else 0
-)
+# train_loader = VectorizedFastDataLoader(
+#     data_path=data_dir,
+#     block_size=block_size,
+#     batch_size=batch_size,
+#     split='train',
+#     device=device,
+#     seed=1337,
+#     rank=seed_offset if USE_DDP else 0
+# )
 
-val_loader = VectorizedFastDataLoader(
-    data_path=data_dir,
-    block_size=block_size,
-    batch_size=batch_size,
-    split='val',
-    device=device,
-    seed=1337,
-    rank=seed_offset if USE_DDP else 0
-)
+# val_loader = VectorizedFastDataLoader(
+#     data_path=data_dir,
+#     block_size=block_size,
+#     batch_size=batch_size,
+#     split='val',
+#     device=device,
+#     seed=1337,
+#     rank=seed_offset if USE_DDP else 0
+# )
+
+# -----------------------------------------------------------------------------
+# Our own simple Distributed Data Loader
+
+def _peek_data_shard(filename):
+    # only reads the header, returns header data
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    if header[0] != 20240520:
+        print("ERROR: magic number mismatch in the data .bin file!")
+        print("---> HINT: Are you passing in a correct file with --input_bin?")
+        print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
+        print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
+        exit(1)
+    assert header[1] == 1, "unsupported version"
+    ntok = header[2] # number of tokens (claimed)
+    return ntok # for now just return the number of tokens
+
+def _load_data_shard(filename):
+    with open(filename, "rb") as f:
+        # first read the header, which is 256 int32 integers (4 bytes each)
+        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
+        assert header[1] == 1, "unsupported version"
+        ntok = header[2] # number of tokens (claimed)
+        # the rest of it are tokens, stored as uint16
+        tokens = np.frombuffer(f.read(), dtype=np.uint16)
+    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    return tokens
+
+class DistributedDataLoader:
+    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+        self.B = B
+        self.T = T
+
+        # glob files that match the pattern
+        self.files = sorted(glob.glob(filename_pattern))
+        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+
+        # load and validate all data shards, count number of tokens in total
+        ntok_total = 0
+        for fname in self.files:
+            shard_ntok = _peek_data_shard(fname)
+            assert shard_ntok >= num_processes * B * T + 1
+            ntok_total += int(shard_ntok)
+        self.ntok_total = ntok_total
+
+        # kick things off
+        self.reset()
+
+    def reset(self):
+        self.current_shard = 0
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def advance(self): # advance to next data shard
+        self.current_shard = (self.current_shard + 1) % len(self.files)
+        self.current_position = self.process_rank * self.B * self.T
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
+    def next_batch(self):
+        B = self.B
+        T = self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance current position and load next shard if necessary
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.advance()
+        return x.cuda(), y.cuda()
+
+train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank, ddp_world_size)
+val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank, ddp_world_size)
+if master_process:
+    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+x, y = train_loader.next_batch()
 
 @torch.no_grad()
 def get_batch(split):
     """Get a batch from the appropriate dataloader."""
     if split == 'train':
-        return train_loader.get_batch()
+        return train_loader.next_batch()
     else:
-        return val_loader.get_batch()
+        return val_loader.next_batch()
 
 @torch.no_grad()
 def estimate_loss(reuse_input=None, reuse_target=None):
@@ -169,16 +254,20 @@ def estimate_loss(reuse_input=None, reuse_target=None):
     
     for split in ['train', 'val']:
         loss_sum = 0.0  
-        for k in range(eval_iters):
+        for _ in range(eval_iters):
             # Get batch data for batch size 1
-            data = train_data if split == 'train' else val_data
-            ix = torch.randint(len(data) - block_size, (eval_batch_size,))
-            idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
-            idx_y = idx_x + 1
+            # data = train_data if split == 'train' else val_data
+            # ix = torch.randint(len(data) - block_size, (eval_batch_size,))
+            # idx_x = ix.unsqueeze(1) + torch.arange(block_size, device='cpu')
+            # idx_y = idx_x + 1
             
-            # Copy into the batch-size-1 slice
-            eval_input.copy_(data[idx_x], non_blocking=True)
-            eval_target.copy_(data[idx_y], non_blocking=True)
+            # # Copy into the batch-size-1 slice
+            # eval_input.copy_(data[idx_x], non_blocking=True)
+            # eval_target.copy_(data[idx_y], non_blocking=True)
+            
+            x, y = get_batch(split)
+            eval_input.copy_(x[:eval_batch_size], non_blocking=True)
+            eval_target.copy_(y[:eval_batch_size], non_blocking=True)
             
             with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
                 with te.fp8_autocast(enabled=USE_FP8, fp8_recipe=fp8_recipe, fp8_group=amax_reduction_group):
@@ -325,9 +414,9 @@ else:
     raw_model = model
 
 # Compile after wrapping with DDP
-model = torch.compile(model, mode='max-autotune-no-cudagraphs')
+# model = torch.compile(model, mode='max-autotune-no-cudagraphs')
 
-@torch.compile()
+# @torch.compile()
 def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
     
@@ -415,6 +504,7 @@ for iter in range(max_iters):
     #         optimizer_zero_grad()   
     else:    
         xb, yb = get_batch('train')
+
         # Control gradient synchronization for gradient accumulation
         if USE_DDP: 
             model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)       

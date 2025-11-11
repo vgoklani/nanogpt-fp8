@@ -1,0 +1,1 @@
+torchrun --standalone --nproc-per-node=8 train.py 
