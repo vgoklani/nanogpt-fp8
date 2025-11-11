@@ -5,13 +5,14 @@ import time
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support,check_mxfp8_support,check_nvfp4_support,get_device_compute_capability
 from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling,MXFP8BlockScaling
-from normuon import SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
+from normuon import NorMuon, SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
 import bitsandbytes as bnb
 import numpy as np
 import os
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
 
 
 
@@ -24,13 +25,13 @@ print("\nDevice Compute Capability:", get_device_compute_capability())
 USE_FP8 = True
 USE_AMP = True
 USE_FP8_WEIGHTS = False
-USE_CUDA_GRAPH = False
+USE_CUDA_GRAPH = False # does not work currently
 USE_DDP = True
 
 
 # hyperparameters
-total_batch_size = 524288 # total tokens per batch
-batch_size = 5 # how many independent sequences will we process in parallel?
+# total_batch_size = 524288 # total tokens per batch
+batch_size = 4 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
@@ -46,7 +47,6 @@ vocab_size = 65536
 grad_accum_steps = 32
 # ------------
 print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
-torch.manual_seed(1337)
 fp8_recipe = DelayedScaling()
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
@@ -94,6 +94,7 @@ else:
     data_parallel_group = None
     amax_reduction_group = None
 
+torch.manual_seed(1337 + seed_offset)
 
 @torch.no_grad()
 def get_batch(split):
@@ -180,12 +181,13 @@ class LLM(nn.Module):
             seq_length=block_size,
             micro_batch_size=batch_size,
             set_parallel_mode=USE_DDP,
+            # num_gqa_groups=n_head//2,
             # fuse_wgrad_accumulation=True,
             
         ) for i in range(n_layer)}) 
         self.ln_f = nn.RMSNorm(n_embd) # final layer norm
         self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
-        # self.token_embedding_table.weight = self.lm_head.weight # tie weights
+        self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
     def forward(self, idx, targets=None,is_first_microbatch= False):
         B, T = idx.shape
@@ -259,14 +261,14 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
 # optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
 
-# optimizer_muon = SingleDeviceNorMuon(param_groups[0]['params'],
+# optimizer_muon = NorMuon(param_groups[0]['params'],
 #                                     lr=param_groups[0]['lr'],
 #                                     weight_decay=param_groups[0]['weight_decay'])
 
-optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-                                  lr=param_groups[0]['lr'],
-                                  weight_decay=param_groups[0]['weight_decay'],)
-optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
+# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+#                                   lr=param_groups[0]['lr'],
+#                                   weight_decay=param_groups[0]['weight_decay'],)
+optimizer_adamw = torch.optim.AdamW(model.parameters(),
                                     lr=param_groups[1]['lr'],
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
@@ -294,15 +296,15 @@ def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
     
 def gradscaler_step():
-    gradScaler.step(optimizer_muon)
+    # gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
     
 def optimizer_zero_grad():
-    optimizer_muon.zero_grad()
+    # optimizer_muon.zero_grad()
     optimizer_adamw.zero_grad()
 
 def gradscaler_unscale():
-    gradScaler.unscale_(optimizer_muon)
+    # gradScaler.unscale_(optimizer_muon)
     gradScaler.unscale_(optimizer_adamw)
 
 
