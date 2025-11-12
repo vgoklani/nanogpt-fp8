@@ -1,4 +1,5 @@
 import glob
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -33,21 +34,20 @@ USE_DDP = True
 
 
 # hyperparameters
-# total_batch_size = 524288 # total tokens per batch
-batch_size = 1 # how many independent sequences will we process in parallel?
-block_size = 1024 # what is the maximum context length for predictions?
+total_batch_size = 524288 # total tokens per batch
+batch_size = 32 # how many independent sequences will we process in parallel?
+block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
 eval_interval = 300
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 20
-n_layer = 12
+n_layer = 20
 n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
 dropout = 0.0
-vocab_size = 50304
-grad_accum_steps = 64
+vocab_size = 65536
 dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
 input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
@@ -69,9 +69,6 @@ if USE_DDP:
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 
     seed_offset = ddp_rank 
-    assert grad_accum_steps % ddp_world_size == 0
-    grad_accum_steps //= ddp_world_size
-    
     data_parallel_group = torch.distributed.group.WORLD
     amax_reduction_group = data_parallel_group  
 else:
@@ -83,6 +80,13 @@ else:
     ddp_rank = 0
     ddp_local_rank = 0
 
+grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_size*block_size)))
+total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
+print_interval = grad_accum_steps
+if master_process:
+    print(f"Total_batch_size: {total_batch_size}")
+    print(f"Gradient Accumulation Steps: {grad_accum_steps}")
+    
 torch.manual_seed(1337 + seed_offset)
 
 data_dir = os.path.join('data', dataset)
@@ -246,7 +250,7 @@ class LLM(nn.Module):
         ) for i in range(n_layer)}) 
         self.ln_f = te.LayerNorm(n_embd) # final layer norm
         self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
-        self.token_embedding_table.weight = self.lm_head.weight # tie weights
+        # self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
     def forward(self, idx, targets=None,is_first_microbatch= False):
         B, T = idx.shape
@@ -299,9 +303,9 @@ hidden_gains_biases = [p for p in model.blocks.parameters() if p.ndim < 2]
 nonhidden_params = [*model.token_embedding_table.parameters(),*model.lm_head.parameters(),*model.ln_f.parameters()]
 param_groups = [
     dict(params=hidden_weights, use_muon=True,
-         lr=0.0004, weight_decay=0.01),
+         lr=0.02, weight_decay=0.01),
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
-         lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01),
+         lr=0.001, betas=(0.9, 0.95), weight_decay=0.01),
 ]
 
 
@@ -323,26 +327,26 @@ torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 #                                     lr=param_groups[0]['lr'],
 #                                     weight_decay=param_groups[0]['weight_decay'])
 
-# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-#                                   lr=param_groups[0]['lr'],
-#                                   weight_decay=param_groups[0]['weight_decay'],)
+optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
+                                  lr=torch.tensor(param_groups[0]['lr']),
+                                  weight_decay=param_groups[0]['weight_decay'],)
 
-optimizer_adamw = torch.optim.AdamW(model.parameters(),
+optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
                                     lr=torch.tensor(param_groups[1]['lr']),
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
-                                    # capturable=True,
+                                    capturable=True,
                                     # optim_bits=8,
-                                    fused=True,
+                                    # fused=True,
                                     # foreach=True
                                     )
     
 gradScaler = torch.amp.GradScaler(device='cuda', enabled=USE_AMP)
 
 # After creating optimizers:
-# warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
-# main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
-# scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
+warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
+scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
 
 warmup_scheduler_adamw = LinearLR(optimizer_adamw, start_factor=0.1, total_iters=warmup_iters)
 main_scheduler_adamw = CosineAnnealingLR(optimizer_adamw, T_max=max_iters - warmup_iters, eta_min=min_lr)
@@ -357,24 +361,24 @@ else:
     raw_model = model
 
 # Compile after wrapping with DDP
-# model = torch.compile(model,mode="max-autotune-no-cudagraphs")
+model = torch.compile(model,mode="max-autotune-no-cudagraphs")
 
-# @torch.compile()
+@torch.compile()
 def gradscaler_step_adamw():
     gradScaler.step(optimizer_adamw)
     scheduler_adamw.step()
     
 def gradscaler_step():
-    # gradScaler.step(optimizer_muon)
+    gradScaler.step(optimizer_muon)
     gradscaler_step_adamw()
-    # scheduler_muon.step()
+    scheduler_muon.step()
     
 def optimizer_zero_grad():
-    # optimizer_muon.zero_grad()
+    optimizer_muon.zero_grad()
     optimizer_adamw.zero_grad()
 
 def gradscaler_unscale():
-    # gradScaler.unscale_(optimizer_muon)
+    gradScaler.unscale_(optimizer_muon)
     gradScaler.unscale_(optimizer_adamw)
 
 
