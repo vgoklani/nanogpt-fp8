@@ -30,16 +30,17 @@ print("\nNVFP4 Support:", te.is_nvfp4_available())
 print("\nDevice Compute Capability:", te.get_device_compute_capability())
 
 USE_FP8 = True
-USE_NVFP4 = True
+USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False
-USE_FSDP = True
+USE_FSDP = False
+USE_DDP = True  # For clarity
 
 
 # hyperparameters
 total_batch_size = 524288 # total tokens per batch
-batch_size = 16 # how many independent sequences will we process in parallel?
+batch_size = 2 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
@@ -72,7 +73,7 @@ if USE_NVFP4:
 else:
     recipe = DelayedScaling()
 
-if USE_FSDP:
+if USE_FSDP or USE_DDP:
     init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
@@ -175,8 +176,8 @@ class DistributedDataLoader:
             self.advance()
         return x.cuda(), y.cuda()
 
-train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_FSDP else 0, ddp_world_size if USE_FSDP else 1)
-val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_FSDP else 0, ddp_world_size if USE_FSDP else 1)
+train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP else 0, ddp_world_size if USE_DDP or USE_FSDP else 1)
+val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP else 0, ddp_world_size if USE_DDP or USE_FSDP else 1)
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
@@ -242,7 +243,7 @@ class LLM(nn.Module):
             pretrained_max_position_embeddings=block_size
         )
         self.blocks = nn.ModuleDict({f"block_{i}": te.TransformerLayer(
-            activation='gelu', 
+            activation='relu', 
             attention_dropout=dropout, 
             hidden_dropout=dropout, 
             hidden_size=n_embd, 
@@ -255,7 +256,7 @@ class LLM(nn.Module):
             fuse_qkv_params=True,
             seq_length=block_size,
             micro_batch_size=batch_size,
-            set_parallel_mode=USE_FSDP,
+            # set_parallel_mode=USE_FSDP,
             # num_gqa_groups=n_head//2,
             # fuse_wgrad_accumulation=True,
             
@@ -342,12 +343,12 @@ if USE_FSDP:
     model = FSDP(
         model,
         process_group=data_parallel_group,
-        sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,  # Only shard optimizer states and gradients
+        sharding_strategy=ShardingStrategy.FULL_SHARD,  # Only shard optimizer states and gradients
         use_orig_params=True,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
-        ),
+        # mixed_precision=MixedPrecision(
+        #     param_dtype=torch.bfloat16,
+        #     reduce_dtype=torch.float32,
+        # ),
         auto_wrap_policy=fsdp_wrap_policy,
     )
     
@@ -355,6 +356,16 @@ if USE_FSDP:
     prepare_te_modules_for_fsdp(model)
     
     raw_model = model
+elif USE_DDP:
+    model = torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[ddp_local_rank],
+        # output_device=ddp_local_rank,
+        process_group=data_parallel_group,
+        # broadcast_buffers=False,
+        # static_graph=True,
+    )
+    raw_model = model.module
 else:
     raw_model = model
 
@@ -369,13 +380,13 @@ else:
 #                                   lr=torch.tensor(param_groups[0]['lr']),
 #                                   weight_decay=param_groups[0]['weight_decay'],)
 
-optimizer_adamw = torch.optim.AdamW(model.parameters(),
+optimizer_adamw = te.optimizers.FusedAdam(model.parameters(),
                                     lr=torch.tensor(param_groups[1]['lr']),
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
                                     # capturable=True,
                                     # optim_bits=8,
-                                    fused=True,
+                                    # fused=True,
                                     # foreach=True
                                     )
     
@@ -425,7 +436,9 @@ for iter in range(max_iters):
     
        
     xb, yb = get_batch('train')
-
+    if USE_DDP: 
+        model.require_backward_grad_sync = ((iter + 1) % grad_accum_steps == 0)  
+        
     # FSDP handles gradient synchronization automatically
     with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
         # Use amax_reduction_group for proper FP8 scaling factor synchronization across GPUs (TE best practice)
@@ -439,10 +452,11 @@ for iter in range(max_iters):
     if (iter + 1) % grad_accum_steps == 0:
         # Unscale gradients before clipping
         gradscaler_unscale()
-        
+        if USE_FSDP:
         # Get gradient norm before clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    
+            grad_norm = model.clip_grad_norm_( max_norm=1.0)
+        if USE_DDP: 
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         gradscaler_step()
         gradScaler.update()
         
