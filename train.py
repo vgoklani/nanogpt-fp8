@@ -34,13 +34,13 @@ USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False
-USE_FSDP2 = False  
-USE_DDP = True  # For clarity - only one of FSDP2, DDP should be True
+USE_FSDP2 = True  
+USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
 
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 40 # how many independent sequences will we process in parallel?
+batch_size = 6 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
@@ -248,7 +248,7 @@ class LLM(nn.Module):
             pretrained_max_position_embeddings=block_size
         )
         self.blocks = nn.ModuleDict({f"block_{i}": te.TransformerLayer(
-            activation='relu', 
+            activation='srelu', 
             attention_dropout=dropout, 
             hidden_dropout=dropout, 
             hidden_size=n_embd, 
@@ -256,8 +256,8 @@ class LLM(nn.Module):
             num_attention_heads=n_head,
             attn_input_format='bshd',  # Critical: our input is (batch, seq, hidden)
             bias=False,
-            qk_norm_type='LayerNorm',
-            normalization="LayerNorm",
+            qk_norm_type='RMSNorm',
+            normalization="RMSNorm",
             fuse_qkv_params=True,
             seq_length=block_size,
             micro_batch_size=batch_size,
@@ -266,7 +266,7 @@ class LLM(nn.Module):
             # fuse_wgrad_accumulation=True,
             
         ) for i in range(n_layer)}) 
-        self.ln_f = te.LayerNorm(n_embd) # final layer norm
+        self.ln_f = te.RMSNorm(n_embd) # final layer norm
         self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
@@ -341,7 +341,7 @@ if USE_FSDP2:
             block,
             mesh=device_mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=False,  # Keeps params gathered after forward
+            reshard_after_forward=True,  # Keeps params gathered after forward
         )
     
     # Then apply fully_shard to the entire model (outer sharding)
@@ -349,7 +349,7 @@ if USE_FSDP2:
         model,
         mesh=device_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,  # Keeps params gathered after forward
+        reshard_after_forward=True,  # Keeps params gathered after forward
     )
     raw_model = model
     if master_process:
@@ -376,14 +376,13 @@ param_groups = [
          lr=0.001, betas=(0.9, 0.95), weight_decay=0.01),
 ]
 
-if USE_DDP:
-    optimizer_muon = NorMuon(param_groups[0]['params'],
-                            lr=param_groups[0]['lr'],
-                            weight_decay=param_groups[0]['weight_decay'])
-else: #FSDP2 or single GPU 
-    optimizer_muon = SingleDeviceNorMuon(param_groups[0]['params'],
-                                        lr=param_groups[0]['lr'],
-                                        weight_decay=param_groups[0]['weight_decay'])
+from dion import Muon
+
+optimizer_muon = Muon(param_groups[0]['params'],
+                        lr=param_groups[0]['lr'],
+                        weight_decay=param_groups[0]['weight_decay'],
+                        distributed_mesh=device_mesh if (USE_FSDP2 or USE_DDP) else None)
+
     
 
 # optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
@@ -491,7 +490,7 @@ for iter in range(max_iters):
         
         print(f"step {iter}: train loss {loss.detach():.4f}")
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
-        # print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW: {scheduler_adamw.get_last_lr()[0]:.6f}")  # Add this line
+        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW: {scheduler_adamw.get_last_lr()[0]:.6f}")  # Add this line
         print(f"total time: {total_training_time/60:.2f} min")
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
