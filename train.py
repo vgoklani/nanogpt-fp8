@@ -20,20 +20,11 @@ import torch.distributed as dist
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
-
-
-
-print ("Transformer Engine FP8 support status:")
-print("\nFP8 Block Scaling Support:", te.is_fp8_block_scaling_available())
-print("\nMXFP8 Support:", te.is_mxfp8_available())
-print("\nNVFP4 Support:", te.is_nvfp4_available())
-print("\nDevice Compute Capability:", te.get_device_compute_capability())
-
 USE_FP8 = True
 USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
-USE_FP8_WEIGHTS = False
+USE_FP8_WEIGHTS = False # TODO: currently not supported
 USE_FSDP2 = True  
 USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
 
@@ -47,7 +38,7 @@ print_interval = 20
 eval_interval = 300
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-eval_iters = 20
+eval_iters = 50
 n_layer = 20
 n_embd = n_layer*64
 n_head = max(1, (n_embd + 127) // 128)
@@ -62,7 +53,6 @@ lr_decay_iters = max_iters  # Should be ~= max_iters
 min_lr = 1e-4  # Minimum learning rate (10% of max LR is typical)
 
 # ------------
-print("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 
 check_compute_capability = te.get_device_compute_capability()
 
@@ -83,8 +73,6 @@ if USE_DDP or USE_FSDP2:
     master_process = ddp_rank == 0 
     seed_offset = ddp_rank 
     data_parallel_group = dist.new_group(backend='nccl')
-    amax_reduction_group = data_parallel_group
-    
     # Initialize device mesh for FSDP2
     if USE_FSDP2:
         device_mesh = init_device_mesh("cuda", (ddp_world_size,))
@@ -93,7 +81,6 @@ else:
     seed_offset = 0
     ddp_world_size = 1
     data_parallel_group = None
-    amax_reduction_group = None
     ddp_rank = 0
     ddp_local_rank = 0
     device_mesh = None
@@ -101,9 +88,19 @@ else:
 grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_size*block_size)))
 total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
 print_interval = grad_accum_steps
-if master_process:
-    print(f"Total_batch_size: {total_batch_size}")
-    print(f"Gradient Accumulation Steps: {grad_accum_steps}")
+
+def print0(*args, **kwargs):
+    if master_process:
+        print(*args, **kwargs)
+print0("Transformer Engine FP8 support status:")
+print0("\nFP8 Block Scaling Support:", te.is_fp8_block_scaling_available())
+print0("\nMXFP8 Support:", te.is_mxfp8_available())
+print0("\nNVFP4 Support:", te.is_nvfp4_available())
+print0("\nDevice Compute Capability:", te.get_device_compute_capability())
+print0("__________________________________")
+print0("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
+print0(f"Total_batch_size: {total_batch_size}")
+print0(f"Gradient Accumulation Steps: {grad_accum_steps}")
     
 torch.manual_seed(1337 + seed_offset)
 
@@ -183,9 +180,8 @@ class DistributedDataLoader:
 
 train_loader = DistributedDataLoader(input_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP2 else 0, ddp_world_size if USE_DDP or USE_FSDP2 else 1)
 val_loader = DistributedDataLoader(input_val_bin, batch_size, block_size, ddp_rank if USE_DDP or USE_FSDP2 else 0, ddp_world_size if USE_DDP or USE_FSDP2 else 1)
-if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+print0(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
+print0(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
 
 @torch.no_grad()
 def get_batch(split):
@@ -225,7 +221,7 @@ def estimate_loss(reuse_input=None, reuse_target=None):
             eval_input.copy_(x[:eval_batch_size], non_blocking=True)
             eval_target.copy_(y[:eval_batch_size], non_blocking=True)
             
-            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16),te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=amax_reduction_group):
+            with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16),te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
                 _, loss = raw_model(eval_input, eval_target)
             
             loss_sum += loss.item()
@@ -313,8 +309,7 @@ with te.quantized_model_init(enabled=USE_FP8_WEIGHTS, recipe=recipe):
     model = LLM().to(device)
 
 
-if master_process:
-    print(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
+print0(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
 
 torch.backends.fp32_precision = "tf32"
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -341,7 +336,7 @@ if USE_FSDP2:
             block,
             mesh=device_mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=True,  # Keeps params gathered after forward
+            reshard_after_forward=False,  # Keeps params gathered after forward
         )
     
     # Then apply fully_shard to the entire model (outer sharding)
@@ -349,11 +344,10 @@ if USE_FSDP2:
         model,
         mesh=device_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=True,  # Keeps params gathered after forward
+        reshard_after_forward=False,  # Keeps params gathered after forward
     )
     raw_model = model
-    if master_process:
-        print(f"FSDP2 enabled with {ddp_world_size} GPUs")
+    print0(f"FSDP2 enabled with {ddp_world_size} GPUs")
 
 elif USE_DDP:
     model = torch.nn.parallel.DistributedDataParallel(
@@ -381,7 +375,8 @@ from dion import Muon
 optimizer_muon = Muon(param_groups[0]['params'],
                         lr=param_groups[0]['lr'],
                         weight_decay=param_groups[0]['weight_decay'],
-                        distributed_mesh=device_mesh if (USE_FSDP2 or USE_DDP) else None)
+                        distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
+                        )
 
     
 
@@ -456,8 +451,8 @@ for iter in range(max_iters):
         
     # FSDP handles gradient synchronization automatically
     with torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16):
-        # Use amax_reduction_group for proper FP8 scaling factor synchronization across GPUs (TE best practice)
-        with te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=amax_reduction_group):
+        
+        with te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
             _, loss = model(xb, yb, is_first_microbatch=(iter % grad_accum_steps == 0))
     
     # Scale loss for gradient accumulation
@@ -507,11 +502,6 @@ for iter in range(max_iters):
         print('---- eval ----')
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print('------------')
-
-# # generate from the model
-# context = torch.zeros((1, 1), dtype=torch.long, device=device)
-# if master_process:
-#     print(decode(raw_model.generate(context, max_new_tokens=2000)[0].tolist()))
 
 # Clean up distributed
 if USE_DDP or USE_FSDP2:
