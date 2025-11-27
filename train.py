@@ -21,7 +21,7 @@ from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
 USE_FP8 = True
-USE_NVFP4 = False
+USE_NVFP4 = True
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
@@ -50,7 +50,7 @@ input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval v
 
 warmup_iters = 100  # Number of warmup steps
 lr_decay_iters = max_iters  # Should be ~= max_iters
-min_lr = 1e-4  # Minimum learning rate (10% of max LR is typical)
+min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
 # ------------
 
@@ -362,12 +362,16 @@ else:
 # Create param_groups AFTER FSDP2/DDP wrapping to get correct parameter references
 hidden_weights = [p for p in raw_model.blocks.parameters() if p.ndim >= 2]
 hidden_gains_biases = [p for p in raw_model.blocks.parameters() if p.ndim < 2]
-nonhidden_params = [*raw_model.token_embedding_table.parameters(), *raw_model.lm_head.parameters(), *raw_model.ln_f.parameters()]
+nonhidden_params = [*raw_model.token_embedding_table.parameters(), *raw_model.ln_f.parameters()]
+unembedding_params = [*raw_model.lm_head.parameters()]
 param_groups = [
     dict(params=hidden_weights, use_muon=True,
          lr=0.02, weight_decay=0.01),
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
-         lr=0.001, betas=(0.9, 0.95), weight_decay=0.01),
+         lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
+    dict(params=unembedding_params, use_muon=False,
+         lr=0.004, betas=(0.9, 0.95), weight_decay=0.0),
+    
 ]
 
 from dion import Muon
@@ -384,10 +388,18 @@ optimizer_muon = Muon(param_groups[0]['params'],
 #                                   lr=torch.tensor(param_groups[0]['lr']),
 #                                   weight_decay=param_groups[0]['weight_decay'],)
 
-optimizer_adamw = torch.optim.AdamW(param_groups[1]['params'],
+optimizer_adamw_embedding = torch.optim.AdamW(param_groups[1]['params'],
                                     lr=torch.tensor(param_groups[1]['lr']),
                                     betas=param_groups[1]['betas'],
                                     weight_decay=param_groups[1]['weight_decay'],
+                                    # capturable=True,
+                                    # optim_bits=8,
+                                    fused=True,
+                                    # foreach=True
+                                    )
+optimizer_adamw_unembedding = torch.optim.AdamW(param_groups[2]['params'],
+                                    lr=torch.tensor(param_groups[2]['lr']),
+                                    betas=param_groups[2]['betas'],
                                     # capturable=True,
                                     # optim_bits=8,
                                     fused=True,
@@ -401,11 +413,13 @@ warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=w
 main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
 scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
 
-warmup_scheduler_adamw = LinearLR(optimizer_adamw, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_adamw = CosineAnnealingLR(optimizer_adamw, T_max=max_iters - warmup_iters, eta_min=min_lr)
-scheduler_adamw = SequentialLR(optimizer_adamw, [warmup_scheduler_adamw, main_scheduler_adamw], milestones=[warmup_iters])
+warmup_scheduler_adamw_embedding = LinearLR(optimizer_adamw_embedding, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_adamw_embedding = CosineAnnealingLR(optimizer_adamw_embedding, T_max=max_iters - warmup_iters, eta_min=min_lr)
+scheduler_adamw_embedding = SequentialLR(optimizer_adamw_embedding, [warmup_scheduler_adamw_embedding, main_scheduler_adamw_embedding], milestones=[warmup_iters])
 
-
+warmup_scheduler_adamw_unembedding = LinearLR(optimizer_adamw_unembedding, start_factor=0.1, total_iters=warmup_iters)
+main_scheduler_adamw_unembedding = CosineAnnealingLR(optimizer_adamw_unembedding, T_max=max_iters - warmup_iters, eta_min=min_lr)
+scheduler_adamw_unembedding = SequentialLR(optimizer_adamw_unembedding, [warmup_scheduler_adamw_unembedding, main_scheduler_adamw_unembedding], milestones=[warmup_iters])
 
 # Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
@@ -413,8 +427,10 @@ if USE_COMPILE_MODEL:
 
 # @torch.compile(dynamic=False)
 def gradscaler_step_adamw():
-    gradScaler.step(optimizer_adamw)
-    scheduler_adamw.step()
+    gradScaler.step(optimizer_adamw_embedding)
+    scheduler_adamw_embedding.step()
+    gradScaler.step(optimizer_adamw_unembedding)
+    scheduler_adamw_unembedding.step()
     
 def gradscaler_step():
     gradScaler.step(optimizer_muon)
@@ -423,12 +439,13 @@ def gradscaler_step():
     
 def optimizer_zero_grad():
     optimizer_muon.zero_grad(set_to_none=True)
-    optimizer_adamw.zero_grad(set_to_none=True)
+    optimizer_adamw_embedding.zero_grad(set_to_none=True)
+    optimizer_adamw_unembedding.zero_grad(set_to_none=True)
 
 def gradscaler_unscale():
     gradScaler.unscale_(optimizer_muon)
-    gradScaler.unscale_(optimizer_adamw)
-
+    gradScaler.unscale_(optimizer_adamw_embedding)
+    gradScaler.unscale_(optimizer_adamw_unembedding)
 
 t0 = time.time()  
 total_training_time = 0  # Track total time (excluding first few iterations)
@@ -485,7 +502,7 @@ for iter in range(max_iters):
         
         print(f"step {iter}: train loss {loss.detach():.4f}")
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
-        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW: {scheduler_adamw.get_last_lr()[0]:.6f}")  # Add this line
+        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")  # Add this line
         print(f"total time: {total_training_time/60:.2f} min")
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
