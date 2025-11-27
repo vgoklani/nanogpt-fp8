@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import time
+import wandb
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling,MXFP8BlockScaling
 from normuon import NorMuon, SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
@@ -21,17 +22,26 @@ from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
 from torch.distributed.device_mesh import init_device_mesh
 
 USE_FP8 = True
-USE_NVFP4 = True
+USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
 USE_FSDP2 = True  
 USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
 
+# Wandb logging
+USE_WANDB = True
+WANDB_PROJECT = "nanogpt-fp8"
+WANDB_RUN_NAME = None  # Set to None for auto-generated name
+
+# GPU configuration for MFU calculation
+GPU_PEAK_TFLOPS = 2250  # B200 BF16 peak TFLOPS per GPU
+NUM_GPUS = 4  # Number of GPUs being used
+
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 6 # how many independent sequences will we process in parallel?
+batch_size = 32 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 print_interval = 20
@@ -101,6 +111,37 @@ print0("__________________________________")
 print0("n_layer:", n_layer, "n_embd:", n_embd, "n_head:", n_head, "batch_size:", batch_size, "block_size:", block_size)
 print0(f"Total_batch_size: {total_batch_size}")
 print0(f"Gradient Accumulation Steps: {grad_accum_steps}")
+
+# Initialize wandb on master process
+if USE_WANDB and master_process:
+    wandb_config = {
+        "total_batch_size": total_batch_size,
+        "batch_size": batch_size,
+        "block_size": block_size,
+        "max_iters": max_iters,
+        "learning_rate": learning_rate,
+        "n_layer": n_layer,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "dropout": dropout,
+        "vocab_size": vocab_size,
+        "dataset": dataset,
+        "warmup_iters": warmup_iters,
+        "lr_decay_iters": lr_decay_iters,
+        "min_lr": min_lr,
+        "grad_accum_steps": grad_accum_steps,
+        "use_fp8": USE_FP8,
+        "use_nvfp4": USE_NVFP4,
+        "use_amp": USE_AMP,
+        "use_fsdp2": USE_FSDP2,
+        "use_ddp": USE_DDP,
+        "world_size": ddp_world_size,
+    }
+    wandb.init(
+        project=WANDB_PROJECT,
+        name=WANDB_RUN_NAME,
+        config=wandb_config,
+    )
     
 torch.manual_seed(1337 + seed_offset)
 
@@ -308,8 +349,18 @@ class LLM(nn.Module):
 with te.quantized_model_init(enabled=USE_FP8_WEIGHTS, recipe=recipe):
     model = LLM().to(device)
 
+# Calculate model parameters and FLOPs for MFU
+num_params = sum(p.numel() for p in model.parameters())
+print0(num_params/1e6, 'M parameters')
 
-print0(sum(p.numel() for p in model.parameters())/1e6, 'M parameters')
+# FLOPs calculation for transformer:
+# Forward pass: ~2 * N * T FLOPs per token (matmuls)
+# Backward pass: ~4 * N * T FLOPs per token (2x forward for gradients)
+# Total: ~6 * N FLOPs per token (simplified approximation)
+flops_per_token = 6 * num_params
+flops_per_iter = flops_per_token * (batch_size * block_size * ddp_world_size)
+# Total peak FLOPs across all GPUs (in FLOPs, not TFLOPs)
+total_peak_flops = GPU_PEAK_TFLOPS * 1e12 * NUM_GPUS
 
 torch.backends.fp32_precision = "tf32"
 torch.backends.cuda.matmul.fp32_precision = "tf32"
@@ -366,7 +417,7 @@ nonhidden_params = [*raw_model.token_embedding_table.parameters(), *raw_model.ln
 unembedding_params = [*raw_model.lm_head.parameters()]
 param_groups = [
     dict(params=hidden_weights, use_muon=True,
-         lr=0.02, weight_decay=0.01),
+         lr=0.01, weight_decay=0.01),
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
     dict(params=unembedding_params, use_muon=False,
@@ -380,6 +431,7 @@ optimizer_muon = Muon(param_groups[0]['params'],
                         lr=param_groups[0]['lr'],
                         weight_decay=param_groups[0]['weight_decay'],
                         distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
+                        use_triton=True,
                         )
 
     
@@ -504,6 +556,12 @@ for iter in range(max_iters):
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
         print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")  # Add this line
         print(f"total time: {total_training_time/60:.2f} min")
+        
+        # Calculate MFU
+        flops_achieved = flops_per_iter * iters_since_last_print / dt
+        mfu = flops_achieved / total_peak_flops * 100  # as percentage
+        print(f"MFU: {mfu:.2f}%")
+        
         free, total = torch.cuda.mem_get_info(device)
         mem_used_GB = (total - free) / 1024 ** 3
         # Convert DTensor to regular tensor for FSDP2
@@ -511,6 +569,22 @@ for iter in range(max_iters):
         print(f"grad norm: {grad_norm_value:.4f}")
         print(f"{mem_used_GB:.2f} GB used")
         print('------------')
+        
+        # Log to wandb
+        if USE_WANDB:
+            wandb.log({
+                "train/loss": loss.detach().item(),
+                "train/grad_norm": grad_norm_value,
+                "train/tokens_per_sec": tok_per_sec,
+                "train/mfu": mfu,
+                "train/iter_time": dt,
+                "train/total_time_min": total_training_time / 60,
+                "lr/muon": scheduler_muon.get_last_lr()[0],
+                "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
+                "lr/adamw_unembedding": scheduler_adamw_unembedding.get_last_lr()[0],
+                "system/gpu_memory_gb": mem_used_GB,
+            }, step=iter)
+        
         tlast = time.time()
         last_print_iter = iter  # Update for next tokens/sec calculation
     if iter % eval_interval == 0 and iter > 0 and master_process:
@@ -519,6 +593,17 @@ for iter in range(max_iters):
         print('---- eval ----')
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         print('------------')
+        
+        # Log eval metrics to wandb
+        if USE_WANDB:
+            wandb.log({
+                "eval/train_loss": losses['train'],
+                "eval/val_loss": losses['val'],
+            }, step=iter)
+
+# Finish wandb run
+if USE_WANDB and master_process:
+    wandb.finish()
 
 # Clean up distributed
 if USE_DDP or USE_FSDP2:

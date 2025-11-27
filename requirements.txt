@@ -4,3 +4,5 @@ tqdm
 buildtools 
 transformer_engine[pytorch] 
 bitsandbytes
+wandb
+-e git://github.com/microsoft/dion.git
