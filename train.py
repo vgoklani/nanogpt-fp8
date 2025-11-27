@@ -34,18 +34,12 @@ USE_WANDB = True
 WANDB_PROJECT = "nanogpt-fp8"
 WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
-# GPU configuration for MFU calculation
-GPU_PEAK_TFLOPS = 2250  # B200 BF16 peak TFLOPS per GPU
-NUM_GPUS = 4  # Number of GPUs being used
-
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 32 # how many independent sequences will we process in parallel?
+batch_size = 24 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
-print_interval = 20
-eval_interval = 300
 learning_rate = 1e-3
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 50
@@ -95,9 +89,14 @@ else:
     ddp_local_rank = 0
     device_mesh = None
 
+# GPU configuration for MFU calculation
+GPU_PEAK_TFLOPS = 2250  # B200 BF16 peak TFLOPS per GPU
+NUM_GPUS = ddp_world_size  # Number of GPUs being used
+
 grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_size*block_size)))
 total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
 print_interval = grad_accum_steps
+eval_interval = print_interval * 10
 
 def print0(*args, **kwargs):
     if master_process:
@@ -304,7 +303,7 @@ class LLM(nn.Module):
             
         ) for i in range(n_layer)}) 
         self.ln_f = te.RMSNorm(n_embd) # final layer norm
-        self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
+        self.lm_head = nn.Linear(n_embd, vocab_size,bias=False)
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
     def forward(self, idx, targets=None,is_first_microbatch= False):
@@ -475,7 +474,7 @@ scheduler_adamw_unembedding = SequentialLR(optimizer_adamw_unembedding, [warmup_
 
 # Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
-    model = torch.compile(model)
+    model = torch.compile(model,mode="max-autotune-no-cudagraphs")
 
 # @torch.compile(dynamic=False)
 def gradscaler_step_adamw():
@@ -552,7 +551,7 @@ for iter in range(max_iters):
         tokens_per_iteration = batch_size * block_size * iters_since_last_print * ddp_world_size
         tok_per_sec = int(tokens_per_iteration / dt)
         
-        print(f"step {iter}: train loss {loss.detach():.4f}")
+        print(f"step {iter//grad_accum_steps}: train loss {loss.detach():.4f}")
         print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
         print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")  # Add this line
         print(f"total time: {total_training_time/60:.2f} min")
@@ -583,23 +582,23 @@ for iter in range(max_iters):
                 "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
                 "lr/adamw_unembedding": scheduler_adamw_unembedding.get_last_lr()[0],
                 "system/gpu_memory_gb": mem_used_GB,
-            }, step=iter)
+            }, step=iter//grad_accum_steps)
         
         tlast = time.time()
         last_print_iter = iter  # Update for next tokens/sec calculation
-    if iter % eval_interval == 0 and iter > 0 and master_process:
+    if iter % eval_interval == 0 and iter > 0:
         # Reuse training batch tensors for evaluation to save VRAM
         losses = estimate_loss(reuse_input=xb, reuse_target=yb)
-        print('---- eval ----')
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        print('------------')
+        print0('---- eval ----')
+        print0(f"step {iter//grad_accum_steps}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print0('------------')
         
         # Log eval metrics to wandb
-        if USE_WANDB:
+        if USE_WANDB and master_process and should_print:
             wandb.log({
                 "eval/train_loss": losses['train'],
                 "eval/val_loss": losses['val'],
-            }, step=iter)
+            }, step=iter//grad_accum_steps)
 
 # Finish wandb run
 if USE_WANDB and master_process:
