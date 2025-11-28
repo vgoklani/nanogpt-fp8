@@ -1,16 +1,18 @@
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import glob
 import math
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 import time
 import wandb
+from torch.nn import functional as F
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling,MXFP8BlockScaling
 from normuon import NorMuon, SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
 import bitsandbytes as bnb
 import numpy as np
-import os
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -34,11 +36,10 @@ USE_WANDB = True
 WANDB_PROJECT = "nanogpt-fp8"
 WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 24 # how many independent sequences will we process in parallel?
+batch_size = 7 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -304,7 +305,7 @@ class LLM(nn.Module):
             # fuse_wgrad_accumulation=True,
             
         ) for i in range(n_layer)}) 
-        self.ln_f = te.RMSNorm(n_embd) # final layer norm
+        self.ln_f = te.RMSNorm(n_embd) 
         self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
     
@@ -388,15 +389,20 @@ if USE_FSDP2:
             block,
             mesh=device_mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=True,  # Keeps params gathered after forward
+            reshard_after_forward=False,  # Keeps params gathered after forward
         )
+    fully_shard(model.lm_head,
+        mesh=device_mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=False,  # Keeps params gathered after forward
+    )
     
     # Then apply fully_shard to the entire model (outer sharding)
     fully_shard(
         model,
         mesh=device_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=True,  # Keeps params gathered after forward
+        reshard_after_forward=False,  # Keeps params gathered after forward
     )
     raw_model = model
     print0(f"FSDP2 enabled with {ddp_world_size} GPUs")
