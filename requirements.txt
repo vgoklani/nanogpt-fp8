@@ -5,6 +5,7 @@ buildtools
 setuptools
 bitsandbytes
 wandb
+ninja
 dion @ git+https://github.com/microsoft/dion.git
 --extra-index-url https://pypi.nvidia.com/ 
 transformer_engine[pytorch] 

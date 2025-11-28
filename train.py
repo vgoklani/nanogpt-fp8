@@ -52,7 +52,7 @@ dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
 input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
 
-warmup_iters = 100  # Number of warmup steps
+warmup_iters = 20  # Number of warmup steps
 lr_decay_iters = max_iters  # Should be ~= max_iters
 min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
@@ -97,6 +97,7 @@ grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_s
 total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
 print_interval = grad_accum_steps
 eval_interval = print_interval * 10
+max_iters = max_iters * grad_accum_steps 
 
 def print0(*args, **kwargs):
     if master_process:
@@ -416,7 +417,7 @@ nonhidden_params = [*raw_model.token_embedding_table.parameters(), *raw_model.ln
 unembedding_params = [*raw_model.lm_head.parameters()]
 param_groups = [
     dict(params=hidden_weights, use_muon=True,
-         lr=0.01, weight_decay=0.01),
+         lr=0.02, weight_decay=0.01),
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
     dict(params=unembedding_params, use_muon=False,
