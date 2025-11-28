@@ -8,6 +8,7 @@ import torch.nn as nn
 import time
 import wandb
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling,MXFP8BlockScaling
 from normuon import NorMuon, SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
@@ -30,6 +31,7 @@ USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
 USE_FSDP2 = True  
 USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
+USE_AC_LM_HEAD = True  # Enable activation checkpointing for lm_head
 
 # Wandb logging
 USE_WANDB = True
@@ -39,7 +41,7 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 7 # how many independent sequences will we process in parallel?
+batch_size = 8 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -306,8 +308,19 @@ class LLM(nn.Module):
             
         ) for i in range(n_layer)}) 
         self.ln_f = te.RMSNorm(n_embd) 
-        self.lm_head = te.Linear(n_embd, vocab_size,bias=False)
+        self.lm_head = nn.Linear(n_embd, vocab_size,bias=False) if USE_AC_LM_HEAD else te.Linear(n_embd, vocab_size, bias=False)   
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
+    
+    def _lm_head_with_loss(self, x, targets):
+        """Checkpointed lm_head + loss computation to avoid storing large logits tensor."""
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+        B, T, C = logits.shape
+        logits_flat = logits.view(B * T, C)
+        targets_flat = targets.view(B * T)
+        loss = F.cross_entropy(logits_flat, targets_flat)
+        # Only return loss - returning logits would defeat the purpose of checkpointing
+        # since they'd need to be saved for backward anyway
+        return loss
     
     def forward(self, idx, targets=None,is_first_microbatch= False):
         B, T = idx.shape
@@ -320,15 +333,22 @@ class LLM(nn.Module):
                                           self_attn_mask_type="causal",
                                           is_first_microbatch = is_first_microbatch)
         x = self.ln_f(x) # (B,T,C)
-        logits = self.lm_head(x) # (B,T,vocab_size)
 
-        if targets is None:
-            loss = None
+        # Apply activation checkpointing to lm_head + loss if enabled
+        # This saves memory by NOT storing the large (B*T, vocab_size) logits tensor
+        # Instead, we recompute lm_head during backward pass
+        if USE_AC_LM_HEAD and self.training and targets is not None:
+            loss = checkpoint(self._lm_head_with_loss, x, targets, use_reentrant=False)
+            logits = None  # Don't compute logits separately during training with AC
         else:
-            B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            logits = self.lm_head(x)  # (B,T,vocab_size)
+            if targets is None:
+                loss = None
+            else:
+                B, T, C = logits.shape
+                logits = logits.view(B*T, C)
+                targets = targets.view(B*T)
+                loss = F.cross_entropy(logits, targets)
 
         return logits, loss
     @torch.no_grad()
