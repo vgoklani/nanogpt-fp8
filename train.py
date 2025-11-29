@@ -56,7 +56,7 @@ dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
 input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
 
-warmup_iters = 20  # Number of warmup steps
+warmup_iters = 200  # Number of warmup steps
 lr_decay_iters = max_iters  # Should be ~= max_iters
 min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
@@ -100,7 +100,7 @@ NUM_GPUS = ddp_world_size  # Number of GPUs being used
 grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_size*block_size)))
 total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
 print_interval = grad_accum_steps
-eval_interval = print_interval * 10
+eval_interval = grad_accum_steps * 40
 max_iters = max_iters * grad_accum_steps 
 
 def print0(*args, **kwargs):
@@ -277,6 +277,19 @@ def estimate_loss(reuse_input=None, reuse_target=None):
     return out
 
 
+# Custom init functions for TE TransformerLayer (following https://arxiv.org/pdf/2310.17813)
+def te_init_method(weight):
+    """Init for QKV and FC1 weights in TE TransformerLayer."""
+    fan_out = weight.size(0)
+    fan_in = weight.size(1)
+    std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+    torch.nn.init.normal_(weight, mean=0.0, std=std)
+
+def te_output_layer_init_method(weight):
+    """Init for PROJ and FC2 weights in TE TransformerLayer - zeroed out."""
+    torch.nn.init.zeros_(weight)
+
+
 class LLM(nn.Module):
 
     def __init__(self):
@@ -302,6 +315,8 @@ class LLM(nn.Module):
             fuse_qkv_params=True,
             seq_length=block_size,
             micro_batch_size=batch_size,
+            init_method=te_init_method,
+            output_layer_init_method=te_output_layer_init_method,
             # set_parallel_mode=USE_FSDP,
             # num_gqa_groups=n_head//2,
             # fuse_wgrad_accumulation=True,
@@ -310,10 +325,38 @@ class LLM(nn.Module):
         self.ln_f = te.RMSNorm(n_embd) 
         self.lm_head = nn.Linear(n_embd, vocab_size,bias=False) if USE_AC_LM_HEAD else te.Linear(n_embd, vocab_size, bias=False)   
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
+        
+        # Initialize weights
+        self.init_weights()
+    
+    def init_weights(self):
+        """Initialize weights following Karpathy's nanochat."""
+        self.apply(self._init_weights)
+        # Zero out lm_head (classifier) weights
+        if hasattr(self.lm_head, 'weight'):
+            torch.nn.init.zeros_(self.lm_head.weight)
+        # TE TransformerLayer handles its own init via init_method and output_layer_init_method
+        # Cast embeddings to bf16 to save memory (optimizer can tolerate it)
+        if self.token_embedding_table.weight.device.type == "cuda":
+            self.token_embedding_table.to(dtype=torch.bfloat16)
+    
+    def _init_weights(self, module):
+        """Weight init following https://arxiv.org/pdf/2310.17813"""
+        if isinstance(module, nn.Linear):
+            fan_out = module.weight.size(0)
+            fan_in = module.weight.size(1)
+            std = 1.0 / math.sqrt(fan_in) * min(1.0, math.sqrt(fan_out / fan_in))
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
     
     def _lm_head_with_loss(self, x, targets):
         """Checkpointed lm_head + loss computation to avoid storing large logits tensor."""
         logits = self.lm_head(x)  # (B, T, vocab_size)
+        # Logit softcapping (like Gemma2) - prevents logits from growing too large
+        logits = 30.0 * torch.tanh(logits / 30.0)
         B, T, C = logits.shape
         logits_flat = logits.view(B * T, C)
         targets_flat = targets.view(B * T)
@@ -321,7 +364,6 @@ class LLM(nn.Module):
         # Only return loss - returning logits would defeat the purpose of checkpointing
         # since they'd need to be saved for backward anyway
         return loss
-    
     def forward(self, idx, targets=None,is_first_microbatch= False):
         B, T = idx.shape
         rotary_pos_emb = self.rope(T)  # Shape: (T, 1, 1, head_dim)
@@ -342,6 +384,8 @@ class LLM(nn.Module):
             logits = None  # Don't compute logits separately during training with AC
         else:
             logits = self.lm_head(x)  # (B,T,vocab_size)
+            # Logit softcapping (like Gemma2) - prevents logits from growing too large
+            logits = 30.0 * torch.tanh(logits / 30.0).to(torch.bfloat16)
             if targets is None:
                 loss = None
             else:
@@ -448,7 +492,7 @@ param_groups = [
     dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
          lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
     dict(params=unembedding_params, use_muon=False,
-         lr=0.004, betas=(0.9, 0.95), weight_decay=0.0),
+         lr=0.004, betas=(0.9, 0.95), weight_decay=0.01),
     
 ]
 
@@ -479,23 +523,24 @@ optimizer_adamw_embedding = torch.optim.AdamW(param_groups[1]['params'],
 optimizer_adamw_unembedding = torch.optim.AdamW(param_groups[2]['params'],
                                     lr=torch.tensor(param_groups[2]['lr']),
                                     betas=param_groups[2]['betas'],
+                                    weight_decay=param_groups[2]['weight_decay'],
                                     # capturable=True,
                                     # optim_bits=8,
                                     fused=True,
                                     # foreach=True
                                     )
-
+T_max = (max_iters - warmup_iters)//2
 # After creating optimizers:
 warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=max_iters - warmup_iters, eta_min=min_lr)
+main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=T_max, eta_min=min_lr)
 scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
 
 warmup_scheduler_adamw_embedding = LinearLR(optimizer_adamw_embedding, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_adamw_embedding = CosineAnnealingLR(optimizer_adamw_embedding, T_max=max_iters - warmup_iters, eta_min=min_lr)
+main_scheduler_adamw_embedding = CosineAnnealingLR(optimizer_adamw_embedding, T_max=T_max, eta_min=min_lr)
 scheduler_adamw_embedding = SequentialLR(optimizer_adamw_embedding, [warmup_scheduler_adamw_embedding, main_scheduler_adamw_embedding], milestones=[warmup_iters])
 
 warmup_scheduler_adamw_unembedding = LinearLR(optimizer_adamw_unembedding, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_adamw_unembedding = CosineAnnealingLR(optimizer_adamw_unembedding, T_max=max_iters - warmup_iters, eta_min=min_lr)
+main_scheduler_adamw_unembedding = CosineAnnealingLR(optimizer_adamw_unembedding, T_max=T_max, eta_min=min_lr)
 scheduler_adamw_unembedding = SequentialLR(optimizer_adamw_unembedding, [warmup_scheduler_adamw_unembedding, main_scheduler_adamw_unembedding], milestones=[warmup_iters])
 
 # Compile after wrapping with FSDP
@@ -527,11 +572,12 @@ def optimizer_zero_grad():
 
 t0 = time.time()  
 total_training_time = 0  # Track total time (excluding first few iterations)
-tlast = t0
 grad_norm = 0.0  # Track gradient norm for logging
 last_print_iter = 0  # Track which iteration we last printed at
+torch.cuda.synchronize()
+tlast = time.time()  # Initialize after first sync for accurate first interval
+
 for iter in range(max_iters):
-    t1 = time.time()
     # Skip printing at iter=0 to avoid incorrect token counting (only 1 iter done, but would count as print_interval)
     should_print = (iter > 0 and iter % print_interval == 0) or iter == max_iters - 1
     
@@ -560,13 +606,9 @@ for iter in range(max_iters):
         optimizer_step(step)
         optimizer_zero_grad()
     
-    
-    # Track total training time (skip first 10 iterations for warmup)
-    if iter > 10 and master_process:
-        dt = time.time() - t1
-        total_training_time += dt
-    
     if should_print and master_process:
+        # Sync GPU before timing to get accurate measurement
+        torch.cuda.synchronize()
         t2 = time.time()
         dt = t2 - tlast 
         
@@ -574,33 +616,41 @@ for iter in range(max_iters):
         iters_since_last_print = iter - last_print_iter
         tokens_per_iteration = batch_size * block_size * iters_since_last_print * ddp_world_size
         tok_per_sec = int(tokens_per_iteration / dt)
+        avg_iter_time = dt / iters_since_last_print  # Average time per iteration
         
-        print(f"step {step}: train loss {loss.detach():.4f}")
-        print(f"iter time: {dt:.4f}s | tok/sec: {tok_per_sec:,}")
-        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")  # Add this line
-        print(f"total time: {total_training_time/60:.2f} min")
+        # Track total training time (skip first interval for warmup)
+        if iter > print_interval:
+            total_training_time += dt
+        
+        # Cache values that require GPU sync (avoid multiple .item() calls)
+        loss_value = loss.detach().item()
+        grad_norm_value = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+        free, total_mem = torch.cuda.mem_get_info(device)
+        mem_used_GB = (total_mem - free) / 1024 ** 3
         
         # Calculate MFU
         flops_achieved = flops_per_iter * iters_since_last_print / dt
         mfu = flops_achieved / total_peak_flops * 100  # as percentage
-        print(f"MFU: {mfu:.2f}%")
         
-        free, total = torch.cuda.mem_get_info(device)
-        mem_used_GB = (total - free) / 1024 ** 3
-        # Convert DTensor to regular tensor for FSDP2
-        grad_norm_value = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+        print(f"step {step}: train loss {loss_value:.4f}")
+        print(f"avg iter time: {avg_iter_time*1000:.2f}ms | tok/sec: {tok_per_sec:,}")
+        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")
+        print(f"total time: {total_training_time/60:.2f} min")
+        print(f"MFU: {mfu:.2f}%")
         print(f"grad norm: {grad_norm_value:.4f}")
         print(f"{mem_used_GB:.2f} GB used")
-        print('------------')
+        
+        # Measure logging overhead
+        t_log_start = time.time()
         
         # Log to wandb
         if USE_WANDB:
             wandb.log({
-                "train/loss": loss.detach().item(),
+                "train/loss": loss_value,
                 "train/grad_norm": grad_norm_value,
                 "train/tokens_per_sec": tok_per_sec,
                 "train/mfu": mfu,
-                "train/iter_time": dt,
+                "train/iter_time": avg_iter_time,
                 "train/total_time_min": total_training_time / 60,
                 "lr/muon": scheduler_muon.get_last_lr()[0],
                 "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
@@ -608,21 +658,52 @@ for iter in range(max_iters):
                 "system/gpu_memory_gb": mem_used_GB,
             }, step=step)
         
+        log_overhead = (time.time() - t_log_start) * 1000
+        print_overhead = (time.time() - t2) * 1000
+        print(f"[DEBUG] print+log overhead: {print_overhead:.1f}ms (wandb: {log_overhead:.1f}ms)")
+        print('------------')
+        
         tlast = time.time()
         last_print_iter = iter  # Update for next tokens/sec calculation
     if iter % eval_interval == 0 and iter > 0:
         # Reuse training batch tensors for evaluation to save VRAM
         losses = estimate_loss(reuse_input=xb, reuse_target=yb)
+        
+        # Compute logit statistics during eval (no perf impact since we're already syncing)
+        model.eval()
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=USE_AMP, dtype=torch.bfloat16), te.autocast(enabled=(USE_FP8 or USE_NVFP4), recipe=recipe, amax_reduction_group=data_parallel_group):
+            logits, _ = raw_model(xb[:1], yb[:1])  # Use batch size 1 for stats
+            if logits is not None:
+                logit_stats = {
+                    'max': logits.max().item(),
+                    'min': logits.min().item(),
+                    'mean': logits.mean().item(),
+                    'std': logits.std().item(),
+                }
+            else:
+                logit_stats = None
+        model.train()
+        
         print0('---- eval ----')
         print0(f"step {step}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if logit_stats is not None:
+            print0(f"logits: max={logit_stats['max']:.2f}, min={logit_stats['min']:.2f}, mean={logit_stats['mean']:.4f}, std={logit_stats['std']:.4f}")
         print0('------------')
         
         # Log eval metrics to wandb
-        if USE_WANDB and master_process and should_print:
-            wandb.log({
+        if USE_WANDB and master_process:
+            log_dict = {
                 "eval/train_loss": losses['train'],
                 "eval/val_loss": losses['val'],
-            }, step=step)
+            }
+            if logit_stats is not None:
+                log_dict.update({
+                    "logits/max": logit_stats['max'],
+                    "logits/min": logit_stats['min'],
+                    "logits/mean": logit_stats['mean'],
+                    "logits/std": logit_stats['std'],
+                })
+            wandb.log(log_dict, step=step)
 
 # Finish wandb run
 if USE_WANDB and master_process:
