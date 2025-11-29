@@ -292,9 +292,9 @@ class LLM(nn.Module):
             num_attention_heads=n_head,
             attn_input_format='bshd',  # Critical: our input is (batch, seq, hidden)
             bias=False,
-            qk_norm_type='L2Normalization',
+            qk_norm_type="RMSNorm", # L2 normalization degrades stability
             normalization="RMSNorm",
-            fuse_qkv_params=False, #HAS TO BE FALSE IF USING MUON OTHERWISE WONT CONVERGE PROPERLY
+            fuse_qkv_params=True, #HAS TO BE FALSE IF USING MUON OTHERWISE WONT CONVERGE PROPERLY
             seq_length=block_size,
             micro_batch_size=batch_size,
             init_method=te_init_method,
