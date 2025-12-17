@@ -1,5 +1,5 @@
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import glob
 import math
@@ -11,8 +11,6 @@ from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling, Float8BlockScaling,Float8CurrentScaling,NVFP4BlockScaling,MXFP8BlockScaling
-from normuon import NorMuon, SingleDeviceNorMuon, SingleDeviceNorMuonWithAuxAdam
-import bitsandbytes as bnb
 import numpy as np
 
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -29,8 +27,8 @@ USE_NVFP4 = False
 USE_COMPILE_MODEL = False
 USE_AMP = True
 USE_FP8_WEIGHTS = False # TODO: currently not supported
-USE_FSDP2 = False  
-USE_DDP = True  # For clarity - only one of FSDP2, DDP should be True
+USE_FSDP2 = True  
+USE_DDP = False  # For clarity - only one of FSDP2, DDP should be True
 USE_AC_LM_HEAD = False  # Enable activation checkpointing for lm_head
 
 # Wandb logging
@@ -41,7 +39,7 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 32 # how many independent sequences will we process in parallel?
+batch_size = 16 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -294,7 +292,7 @@ class LLM(nn.Module):
             bias=False,
             qk_norm_type="RMSNorm", # L2 normalization degrades stability
             normalization="RMSNorm",
-            fuse_qkv_params=True, #HAS TO BE FALSE IF USING MUON OTHERWISE WONT CONVERGE PROPERLY
+            fuse_qkv_params=True,
             seq_length=block_size,
             micro_batch_size=batch_size,
             init_method=te_init_method,
@@ -426,7 +424,7 @@ if USE_FSDP2:
     # Define mixed precision policy for FSDP2
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
+        reduce_dtype=torch.bfloat16,
     )
     
     # Apply fully_shard to each TransformerLayer block first (inner sharding)
@@ -478,7 +476,7 @@ param_groups = [
     
 ]
 
-from dion import Muon
+from dion import Muon,NorMuon,Dion2,Dion
 
 optimizer_muon = Muon(param_groups[0]['params'],
                         lr=param_groups[0]['lr'],
