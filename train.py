@@ -99,7 +99,8 @@ grad_accum_steps = max(1, math.ceil(total_batch_size / (batch_size * ddp_world_s
 total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
 print_interval = grad_accum_steps
 eval_interval = grad_accum_steps * 40
-max_iters = max_iters * grad_accum_steps 
+max_iters = max_iters * grad_accum_steps
+warmup_iters = warmup_iters * grad_accum_steps  # Scale warmup_iters by grad_accum_steps too 
 
 def print0(*args, **kwargs):
     if master_process:
