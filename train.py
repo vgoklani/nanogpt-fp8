@@ -1,5 +1,5 @@
 import os
-# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import glob
 import math
@@ -39,7 +39,7 @@ WANDB_RUN_NAME = None  # Set to None for auto-generated name
 
 # hyperparameters
 total_batch_size = 512000 # total tokens per batch
-batch_size = 16 # how many independent sequences will we process in parallel?
+batch_size = 6 # how many independent sequences will we process in parallel?
 block_size = 2048 # what is the maximum context length for predictions?
 max_iters = 5000
 learning_rate = 1e-3
@@ -54,7 +54,7 @@ dataset = 'openwebtext-1M'  # name of the dataset subdirectory in ./data/
 input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
 input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
 
-warmup_iters = 200  # Number of warmup steps
+warmup_iters = 400  # Number of warmup steps
 lr_decay_iters = max_iters  # Should be ~= max_iters
 min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
@@ -100,7 +100,7 @@ total_batch_size = batch_size * grad_accum_steps * ddp_world_size * block_size
 print_interval = grad_accum_steps
 eval_interval = grad_accum_steps * 40
 max_iters = max_iters * grad_accum_steps
-warmup_iters = warmup_iters * grad_accum_steps  # Scale warmup_iters by grad_accum_steps too 
+warmup_iters = warmup_iters // grad_accum_steps
 
 def print0(*args, **kwargs):
     if master_process:
@@ -304,7 +304,7 @@ class LLM(nn.Module):
             
         ) for i in range(n_layer)}) 
         self.ln_f = te.RMSNorm(n_embd) 
-        self.lm_head = nn.Linear(n_embd, vocab_size,bias=False) if USE_AC_LM_HEAD else te.Linear(n_embd, vocab_size, bias=False)   
+        self.lm_head = te.Linear(n_embd, vocab_size, bias=False)   
         # self.token_embedding_table.weight = self.lm_head.weight # tie weights
         
         # Initialize weights
@@ -354,14 +354,15 @@ class LLM(nn.Module):
         for i in range(n_layer):
             x = self.blocks[f"block_{i}"](x, rotary_pos_emb=rotary_pos_emb,
                                           self_attn_mask_type="causal",
-                                          is_first_microbatch = is_first_microbatch)
+                                          is_first_microbatch = is_first_microbatch,
+                                          checkpoint_core_attention=False)  # (B,T,C)
         x = self.ln_f(x) # (B,T,C)
 
         # Apply activation checkpointing to lm_head + loss if enabled
         # This saves memory by NOT storing the large (B*T, vocab_size) logits tensor
         # Instead, we recompute lm_head during backward pass
         if USE_AC_LM_HEAD and self.training and targets is not None:
-            loss = checkpoint(self._lm_head_with_loss, x, targets, use_reentrant=False)
+            loss = te.checkpoint(self._lm_head_with_loss, x, targets, use_reentrant=False)
             logits = None  # Don't compute logits separately during training with AC
         else:
             logits = self.lm_head(x)  # (B,T,vocab_size)
@@ -408,16 +409,6 @@ flops_per_token = 6 * num_params
 flops_per_iter = flops_per_token * (batch_size * block_size * ddp_world_size)
 # Total peak FLOPs across all GPUs (in FLOPs, not TFLOPs)
 total_peak_flops = GPU_PEAK_TFLOPS * 1e12 * NUM_GPUS
-
-torch.backends.fp32_precision = "tf32"
-torch.backends.cuda.matmul.fp32_precision = "tf32"
-torch.backends.cudnn.fp32_precision = "tf32"
-torch.backends.cudnn.conv.fp32_precision = "tf32"
-torch.backends.cudnn.rnn.fp32_precision = "tf32"
-# torch.backends.cuda.matmul.allow_tf32 = True # old api
-# torch.backends.cudnn.allow_tf32 = True       # old api
-torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
-torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
 # Wrap with FSDP/FSDP2 BEFORE compiling
 if USE_FSDP2:
@@ -467,62 +458,26 @@ hidden_weights = [p for p in raw_model.blocks.parameters() if p.ndim >= 2]
 hidden_gains_biases = [p for p in raw_model.blocks.parameters() if p.ndim < 2]
 nonhidden_params = [*raw_model.token_embedding_table.parameters(), *raw_model.ln_f.parameters()]
 unembedding_params = [*raw_model.lm_head.parameters()]
+
 param_groups = [
-    dict(params=hidden_weights, use_muon=True,
-         lr=0.02, weight_decay=0.01),
-    dict(params=hidden_gains_biases+nonhidden_params, use_muon=False,
-         lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
-    dict(params=unembedding_params, use_muon=False,
-         lr=0.004, betas=(0.9, 0.95), weight_decay=0.01),
-    
+    dict(params=hidden_weights,lr=0.02), 
+    dict(params=hidden_gains_biases+nonhidden_params, algorithm="adamw",lr=0.2, betas=(0.9, 0.95), weight_decay=0.01),
+    dict(params=unembedding_params, algorithm="adamw",lr=0.004, betas=(0.9, 0.95), weight_decay=0.01)
 ]
 
 from dion import Muon,NorMuon,Dion2,Dion
 
-optimizer_muon = Muon(param_groups[0]['params'],
-                        lr=param_groups[0]['lr'],
-                        weight_decay=param_groups[0]['weight_decay'],
+optimizer_muon = Muon(param_groups,
                         distributed_mesh=device_mesh if (USE_FSDP2) else data_parallel_group if (USE_DDP) else None,
-                        use_triton=True,
+                        use_triton=True, 
                         )
 
     
-
-# optimizer_muon = torch.optim.Muon(param_groups[0]['params'],
-#                                   lr=torch.tensor(param_groups[0]['lr']),
-#                                   weight_decay=param_groups[0]['weight_decay'],)
-
-optimizer_adamw_embedding = torch.optim.AdamW(param_groups[1]['params'],
-                                    lr=torch.tensor(param_groups[1]['lr']),
-                                    betas=param_groups[1]['betas'],
-                                    weight_decay=param_groups[1]['weight_decay'],
-                                    # capturable=True,
-                                    # optim_bits=8,
-                                    fused=True,
-                                    # foreach=True
-                                    )
-optimizer_adamw_unembedding = torch.optim.AdamW(param_groups[2]['params'],
-                                    lr=torch.tensor(param_groups[2]['lr']),
-                                    betas=param_groups[2]['betas'],
-                                    weight_decay=param_groups[2]['weight_decay'],
-                                    # capturable=True,
-                                    # optim_bits=8,
-                                    fused=True,
-                                    # foreach=True
-                                    )
 T_max = (max_iters - warmup_iters)//2
 # After creating optimizers:
 warmup_scheduler_muon = LinearLR(optimizer_muon, start_factor=0.1, total_iters=warmup_iters)
 main_scheduler_muon = CosineAnnealingLR(optimizer_muon, T_max=T_max, eta_min=min_lr)
 scheduler_muon = SequentialLR(optimizer_muon, [warmup_scheduler_muon, main_scheduler_muon], milestones=[warmup_iters])
-
-warmup_scheduler_adamw_embedding = LinearLR(optimizer_adamw_embedding, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_adamw_embedding = CosineAnnealingLR(optimizer_adamw_embedding, T_max=T_max, eta_min=min_lr)
-scheduler_adamw_embedding = SequentialLR(optimizer_adamw_embedding, [warmup_scheduler_adamw_embedding, main_scheduler_adamw_embedding], milestones=[warmup_iters])
-
-warmup_scheduler_adamw_unembedding = LinearLR(optimizer_adamw_unembedding, start_factor=0.1, total_iters=warmup_iters)
-main_scheduler_adamw_unembedding = CosineAnnealingLR(optimizer_adamw_unembedding, T_max=T_max, eta_min=min_lr)
-scheduler_adamw_unembedding = SequentialLR(optimizer_adamw_unembedding, [warmup_scheduler_adamw_unembedding, main_scheduler_adamw_unembedding], milestones=[warmup_iters])
 
 # Compile after wrapping with FSDP
 if USE_COMPILE_MODEL:
@@ -537,19 +492,13 @@ def get_muon_momentum(it):
 def optimizer_step(step=None):
     
     for group in optimizer_muon.param_groups:
-        group["momentum"] = get_muon_momentum(step)
+        group["mu"] = get_muon_momentum(step)  # NorMuon uses 'mu' not 'momentum'
     
     optimizer_muon.step()
     scheduler_muon.step()
-    optimizer_adamw_embedding.step()
-    scheduler_adamw_embedding.step()
-    optimizer_adamw_unembedding.step()
-    scheduler_adamw_unembedding.step()
     
 def optimizer_zero_grad():
     optimizer_muon.zero_grad(set_to_none=True)
-    optimizer_adamw_embedding.zero_grad(set_to_none=True)
-    optimizer_adamw_unembedding.zero_grad(set_to_none=True)
 
 t0 = time.time()  
 total_training_time = 0  # Track total time (excluding first few iterations)
@@ -618,7 +567,7 @@ for iter in range(max_iters):
         
         print(f"step {step}: train loss {loss_value:.4f}")
         print(f"avg iter time: {avg_iter_time*1000:.2f}ms | tok/sec: {tok_per_sec:,}")
-        print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")
+        # print(f"lr: Muon:{scheduler_muon.get_last_lr()[0]:.6f}, AdamW Embd: {scheduler_adamw_embedding.get_last_lr()[0]:.6f}, AdamW LM_head: {scheduler_adamw_unembedding.get_last_lr()[0]:.6f}")
         print(f"total time: {total_training_time/60:.2f} min")
         print(f"MFU: {mfu:.2f}%")
         print(f"grad norm: {grad_norm_value:.4f}")
@@ -637,8 +586,8 @@ for iter in range(max_iters):
                 "train/iter_time": avg_iter_time,
                 "train/total_time_min": total_training_time / 60,
                 "lr/muon": scheduler_muon.get_last_lr()[0],
-                "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
-                "lr/adamw_unembedding": scheduler_adamw_unembedding.get_last_lr()[0],
+                # "lr/adamw_embedding": scheduler_adamw_embedding.get_last_lr()[0],
+                # "lr/adamw_unembedding": scheduler_adamw_unembedding.get_last_lr()[0],
                 "system/gpu_memory_gb": mem_used_GB,
             }, step=step)
         

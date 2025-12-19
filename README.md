@@ -89,8 +89,11 @@ Training on 8x RTX Pro 6000 with batch_size=16 reached val loss <3.28 in 36.5 mi
 8xRTX 5090 32GB - total_BS = 524288 - FSDP2 (reshard_after_forward=False):
 
 BS=1 nanochat: 14.27GB 273K tps - this: 9.770GB 144K tps
+
 BS=4 nanochat: 20.34GB 333K tps - this: 21.27GB 360K tps
+
 BS=6 nanochat: 24.47GB 355K tps - this: 30.39GB 431K tps (total_BS = 589824 for both)
+
 BS=8 nanochat: 28.48GB 348K tps - this: OOM
 
 as you can see the mem usage grows more rapidly with BS in this repo.
