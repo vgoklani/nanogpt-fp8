@@ -32,10 +32,11 @@ from transformer_engine.common.recipe import (
 assert torch.cuda.is_available()
 
 
-USE_FP8 = True
+USE_MXFP8 = False
 USE_NVFP4 = False
+USE_FP8_BLOCK_SCALING = True
 USE_COMPILE_MODEL = False
-USE_AMP = True  # why do we need this?
+USE_AMP = False  # why do we need this?
 USE_FP8_WEIGHTS = False  # sigh
 USE_FSDP2 = False
 USE_DDP = True
@@ -57,6 +58,7 @@ n_embd = n_layer * 64  # 1280
 n_head = max(1, (n_embd + 127) // 128)  # 10
 dropout = 0.0
 vocab_size = 65_536
+
 dataset = "kjj0/finewebedu10B-gpt2"
 input_bin = "/huggingface_hub/datasets/kjj0/finewebedu10B_gpt2/finewebedu_train_*.bin"
 input_val_bin = "/huggingface_hub/datasets/kjj0/finewebedu10B_gpt2/finewebedu_val_*.bin"
@@ -68,12 +70,29 @@ min_lr = 1e-8  # Minimum learning rate (10% of max LR is typical)
 
 check_compute_capability = te.get_device_compute_capability()
 
+#################
+
+
+#################
+
 if USE_NVFP4:
-    # RTX 5000 series and RTX Pro 6000 do not support rht and sr as of TE==2.9.0
     is_rtx = check_compute_capability == (12, 0)
     recipe = NVFP4BlockScaling(disable_rht=is_rtx, disable_stochastic_rounding=is_rtx)
+    assert te.is_nvfp4_available()
+# elif USE_MXFP8:
+#     # MXFP8 (for all gemm layouts) is not supported on 12.0+ architectures yet.
+#     # https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.is_mxfp8_available
+#     mxfp8_format = Format.E4M3  # E4M3 used everywhere
+#     recipe = MXFP8BlockScaling(fp8_format=mxfp8_format)
+#     te.is_mxfp8_available(return_reason=True)
+elif USE_FP8_BLOCK_SCALING:
+    fp8_format = Format.HYBRID  # E4M3 during forward pass, E5M2 during backward pass
+    recipe = DelayedScaling(
+        fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max"
+    )
+    assert te.is_fp8_block_scaling_available()
 else:
-    recipe = DelayedScaling()
+    pass
 
 if USE_DDP or USE_FSDP2:
     init_process_group(backend="nccl")
@@ -129,6 +148,7 @@ print0(
     f"{n_layer=} - {n_embd=} - {n_head=} - {device_batch_size=} - {block_size=} - {total_batch_size=} - {grad_accum_steps=}"
 )
 
+#################
 
 # Initialize wandb on master process
 if USE_WANDB and master_process:
@@ -148,7 +168,7 @@ if USE_WANDB and master_process:
         "lr_decay_iters": lr_decay_iters,
         "min_lr": min_lr,
         "grad_accum_steps": grad_accum_steps,
-        "use_fp8": USE_FP8,
+        "use_mxfp8": USE_MXFP8,
         "use_nvfp4": USE_NVFP4,
         "use_amp": USE_AMP,
         "use_fsdp2": USE_FSDP2,
@@ -161,8 +181,10 @@ torch.manual_seed(1337 + seed_offset)
 
 # data_dir = os.path.join("data", dataset)
 
+#################
 
-def _peek_data_shard(filename):
+
+def _peek_data_shard(filename: str):
     # only reads the header, returns header data
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
@@ -182,7 +204,7 @@ def _peek_data_shard(filename):
     return ntok  # for now just return the number of tokens
 
 
-def _load_data_shard(filename):
+def _load_data_shard(filename: str):
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
         header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
@@ -195,7 +217,7 @@ def _load_data_shard(filename):
     return tokens
 
 
-class DistributedDataLoader:
+class DistributedDataLoader(object):
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
         self.process_rank = process_rank
         self.num_processes = num_processes
