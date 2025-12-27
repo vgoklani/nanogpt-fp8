@@ -29,8 +29,6 @@ from transformer_engine.common.recipe import (
     NVFP4BlockScaling,
 )
 
-datasets_directory = os.path.join(os.environ["HUGGINGFACE_HUB_DIRECTORY"], "datasets")
-
 assert torch.cuda.is_available()
 
 
@@ -51,7 +49,7 @@ device_batch_size = 16
 block_size = 2048
 total_batch_size = 524_288  # 8 * 2048 * 32
 max_iters = 5_000
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = "cuda"
 eval_iters = 50
 n_layer = 20
@@ -59,12 +57,9 @@ n_embd = n_layer * 64  # 1280
 n_head = max(1, (n_embd + 127) // 128)  # 10
 dropout = 0.0
 vocab_size = 65_536
-repo_id = "kjj0/finewebedu10B-gpt2"
-# dataset = "openwebtext-1M"  # name of the dataset subdirectory in ./data/
-# input_bin: str = "data/fineweb10B/fineweb_train_*.bin"  # input .bin to train on
-# input_val_bin: str = (
-#     "data/fineweb10B/fineweb_val_*.bin"  # input .bin to eval validation loss on
-# )
+dataset = "kjj0/finewebedu10B-gpt2"
+input_bin = "/huggingface_hub/datasets/kjj0/finewebedu10B_gpt2/finewebedu_train_*.bin"
+input_val_bin = "/huggingface_hub/datasets/kjj0/finewebedu10B_gpt2/finewebedu_val_*.bin"
 
 warmup_iters = 400  # Number of warmup steps
 lr_decay_iters = max_iters  # Should be ~= max_iters
@@ -252,14 +247,14 @@ class DistributedDataLoader:
 
 train_loader = DistributedDataLoader(
     input_bin,
-    batch_size,
+    device_batch_size,
     block_size,
     ddp_rank if USE_DDP or USE_FSDP2 else 0,
     ddp_world_size if USE_DDP or USE_FSDP2 else 1,
 )
 val_loader = DistributedDataLoader(
     input_val_bin,
-    batch_size,
+    device_batch_size,
     block_size,
     ddp_rank if USE_DDP or USE_FSDP2 else 0,
     ddp_world_size if USE_DDP or USE_FSDP2 else 1,
